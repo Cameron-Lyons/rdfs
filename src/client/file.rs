@@ -1,15 +1,14 @@
-use crate::client::{connection::ConnectionManager, error::DfsError};
-use tokio::io::{AsyncRead, AsyncWrite};
+use crate::client::{connection::{ConnectionManager, FileMetadata}, error::DfsError};
 
 pub struct DfsFile {
-    path: String,
+    _path: String,
     metadata: FileMetadata,
     conn: ConnectionManager,
 }
 
 impl DfsFile {
     pub fn new(path: String, metadata: FileMetadata, conn: ConnectionManager) -> Self {
-        Self { path, metadata, conn }
+        Self { _path: path, metadata, conn }
     }
 
     pub async fn read_block(&self, block_id: u64) -> Result<Vec<u8>, DfsError> {

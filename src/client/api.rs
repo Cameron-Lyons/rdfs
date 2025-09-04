@@ -1,5 +1,10 @@
-use crate::client::{connection::ConnectionManager, file::DfsFile, error::DfsError};
+use crate::client::{
+    connection::{ConnectionManager, ConnectionStatsSnapshot},
+    file::DfsFile,
+    error::DfsError
+};
 
+#[derive(Clone)]
 pub struct DfsClient {
     conn: ConnectionManager,
 }
@@ -17,5 +22,9 @@ impl DfsClient {
 
     pub async fn delete(&self, path: &str) -> Result<(), DfsError> {
         self.conn.delete_file(path).await
+    }
+
+    pub async fn get_connection_stats(&self) -> ConnectionStatsSnapshot {
+        self.conn.get_stats().await
     }
 }

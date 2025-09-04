@@ -1,4 +1,4 @@
-use dfs_client::client::DfsClient;
+use rdfs::client::api::DfsClient;
 
 #[tokio::main]
 async fn main() {
