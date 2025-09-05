@@ -46,7 +46,7 @@ impl ReplicationManager {
             let metadata_store = Arc::clone(&self.metadata_store);
 
             let task = tokio::spawn(async move {
-                if let Ok(_) = write_to_node(&node_clone, block_id, &data_clone).await {
+                if write_to_node(&node_clone, block_id, &data_clone).await.is_ok() {
                     metadata_store
                         .update_block_replicas(&file_path_clone, block_id, node_clone.id.clone())
                         .await;
@@ -65,7 +65,7 @@ impl ReplicationManager {
             }
         }
 
-        if successful_replicas.len() >= self.replication_factor / 2 + 1 {
+        if successful_replicas.len() > self.replication_factor / 2 {
             Ok(successful_replicas)
         } else {
             Err(format!(
@@ -85,16 +85,13 @@ impl ReplicationManager {
 
         for block in &file_info.blocks {
             let replica_count = block.replicas.len();
-            
+
             if replica_count < self.replication_factor {
                 let needed = self.replication_factor - replica_count;
                 let available_nodes = self.metadata_store.get_active_nodes().await;
-                
-                let existing_node_ids: Vec<String> = block
-                    .replicas
-                    .iter()
-                    .map(|r| r.node_id.clone())
-                    .collect();
+
+                let existing_node_ids: Vec<String> =
+                    block.replicas.iter().map(|r| r.node_id.clone()).collect();
 
                 let new_nodes: Vec<NodeInfo> = available_nodes
                     .into_iter()
@@ -149,15 +146,9 @@ async fn write_to_node(node: &NodeInfo, block_id: u64, data: &[u8]) -> Result<()
 
     let msg = serde_json::to_vec(&request).map_err(|e| e.to_string())?;
     let len = (msg.len() as u32).to_be_bytes();
-    
-    stream
-        .write_all(&len)
-        .await
-        .map_err(|e| e.to_string())?;
-    stream
-        .write_all(&msg)
-        .await
-        .map_err(|e| e.to_string())?;
+
+    stream.write_all(&len).await.map_err(|e| e.to_string())?;
+    stream.write_all(&msg).await.map_err(|e| e.to_string())?;
 
     let mut len_buf = [0u8; 4];
     stream
@@ -189,15 +180,9 @@ async fn read_from_node(node_addr: &str, block_id: u64) -> Result<Vec<u8>, Strin
     let request = Request::ReadBlock { block_id };
     let msg = serde_json::to_vec(&request).map_err(|e| e.to_string())?;
     let len = (msg.len() as u32).to_be_bytes();
-    
-    stream
-        .write_all(&len)
-        .await
-        .map_err(|e| e.to_string())?;
-    stream
-        .write_all(&msg)
-        .await
-        .map_err(|e| e.to_string())?;
+
+    stream.write_all(&len).await.map_err(|e| e.to_string())?;
+    stream.write_all(&msg).await.map_err(|e| e.to_string())?;
 
     let mut len_buf = [0u8; 4];
     stream
@@ -220,3 +205,4 @@ async fn read_from_node(node_addr: &str, block_id: u64) -> Result<Vec<u8>, Strin
         _ => Err("Unexpected response".to_string()),
     }
 }
+

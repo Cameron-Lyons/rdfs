@@ -62,6 +62,15 @@ impl MetadataStore {
             next_block_id: Arc::new(RwLock::new(1)),
         }
     }
+}
+
+impl Default for MetadataStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl MetadataStore {
 
     pub async fn create_file(&self, path: String, replication_factor: usize) -> FileInfo {
         let now = std::time::SystemTime::now()
@@ -210,3 +219,4 @@ impl MetadataStore {
         false
     }
 }
+

@@ -7,11 +7,16 @@ async fn main() {
         .expect("Failed to connect");
 
     println!("Creating new file /hello.txt");
-    let file = client.create("/hello.txt").await.expect("Failed to create file");
+    let file = client
+        .create("/hello.txt")
+        .await
+        .expect("Failed to create file");
     println!("File created at: {}", file.get_path());
 
     println!("\nWriting data to block 0");
-    file.write_block(0, b"Hello, DFS!").await.expect("Write failed");
+    file.write_block(0, b"Hello, DFS!")
+        .await
+        .expect("Write failed");
 
     println!("Reading data from block 0");
     let data = file.read_block(0).await.expect("Read failed");
@@ -33,16 +38,22 @@ async fn main() {
     }
 
     println!("\nRenaming /hello.txt to /goodbye.txt");
-    client.rename("/hello.txt", "/goodbye.txt").await.expect("Rename failed");
+    client
+        .rename("/hello.txt", "/goodbye.txt")
+        .await
+        .expect("Rename failed");
 
     println!("Opening renamed file");
-    let renamed_file = client.open("/goodbye.txt").await.expect("Failed to open renamed file");
+    let renamed_file = client
+        .open("/goodbye.txt")
+        .await
+        .expect("Failed to open renamed file");
     let data = renamed_file.read_block(0).await.expect("Read failed");
     println!("Read from renamed file: {}", String::from_utf8_lossy(&data));
 
     println!("\nDeleting /goodbye.txt");
     client.delete("/goodbye.txt").await.expect("Delete failed");
-    
+
     println!("\nConnection statistics:");
     let stats = client.get_connection_stats().await;
     println!("  Total requests: {}", stats.total_requests);

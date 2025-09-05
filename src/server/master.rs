@@ -104,7 +104,7 @@ async fn handle_client(
 async fn handle_lookup(metadata_store: &Arc<MetadataStore>, path: &str) -> Response {
     if let Some(file_info) = metadata_store.get_file(path).await {
         let active_nodes = metadata_store.get_active_nodes().await;
-        
+
         let storage_nodes: Vec<StorageNode> = active_nodes
             .iter()
             .take(3)
@@ -123,9 +123,7 @@ async fn handle_lookup(metadata_store: &Arc<MetadataStore>, path: &str) -> Respo
 
         Response::Metadata { metadata }
     } else {
-        let file_info = metadata_store
-            .create_file(path.to_string(), 3)
-            .await;
+        let file_info = metadata_store.create_file(path.to_string(), 3).await;
 
         let active_nodes = metadata_store.get_active_nodes().await;
         let storage_nodes: Vec<StorageNode> = active_nodes
@@ -172,3 +170,4 @@ async fn handle_delete(metadata_store: &Arc<MetadataStore>, path: &str) -> Respo
         }
     }
 }
+

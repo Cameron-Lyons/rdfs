@@ -14,9 +14,11 @@ const CONNECTION_TIMEOUT: Duration = Duration::from_secs(5);
 const RETRY_ATTEMPTS: u32 = 3;
 const RETRY_DELAY: Duration = Duration::from_millis(500);
 
+type ConnectionMap = Arc<RwLock<HashMap<String, Arc<Mutex<Option<TcpStream>>>>>>;
+
 #[derive(Clone)]
 struct ConnectionPool {
-    connections: Arc<RwLock<HashMap<String, Arc<Mutex<Option<TcpStream>>>>>>,
+    connections: ConnectionMap,
     last_used: Arc<RwLock<HashMap<String, u64>>>,
 }
 
@@ -121,7 +123,7 @@ struct ConnectionStats {
 impl ConnectionManager {
     pub async fn connect(master_addr: &str) -> Result<Self, DfsError> {
         let connection_pool = ConnectionPool::new();
-        
+
         let _test_stream = timeout(CONNECTION_TIMEOUT, TcpStream::connect(master_addr))
             .await
             .map_err(|_| DfsError::Network(format!("Cannot reach master at {}", master_addr)))?
@@ -145,32 +147,30 @@ impl ConnectionManager {
         Ok(manager)
     }
 
-    async fn execute_with_retry<F, T>(
-        &self,
-        addr: &str,
-        operation: F,
-    ) -> Result<T, DfsError>
+    async fn execute_with_retry<F, T>(&self, addr: &str, operation: F) -> Result<T, DfsError>
     where
-        F: Fn(TcpStream) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(TcpStream, T), DfsError>> + Send>>,
+        F: Fn(
+            TcpStream,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<(TcpStream, T), DfsError>> + Send>,
+        >,
     {
         let mut last_error = None;
 
         for attempt in 1..=RETRY_ATTEMPTS {
             match self.connection_pool.get_connection(addr).await {
-                Ok(stream) => {
-                    match operation(stream).await {
-                        Ok((stream, result)) => {
-                            self.connection_pool.return_connection(addr, stream).await;
-                            return Ok(result);
-                        }
-                        Err(e) => {
-                            last_error = Some(e);
-                            if attempt < RETRY_ATTEMPTS {
-                                sleep(RETRY_DELAY * attempt).await;
-                            }
+                Ok(stream) => match operation(stream).await {
+                    Ok((stream, result)) => {
+                        self.connection_pool.return_connection(addr, stream).await;
+                        return Ok(result);
+                    }
+                    Err(e) => {
+                        last_error = Some(e);
+                        if attempt < RETRY_ATTEMPTS {
+                            sleep(RETRY_DELAY * attempt).await;
                         }
                     }
-                }
+                },
                 Err(e) => {
                     last_error = Some(e);
                     if attempt < RETRY_ATTEMPTS {
@@ -184,7 +184,7 @@ impl ConnectionManager {
         stats.failed_requests += 1;
         stats.last_error = Some(format!("Failed after {} attempts", RETRY_ATTEMPTS));
 
-        Err(last_error.unwrap_or_else(|| DfsError::Unknown))
+        Err(last_error.unwrap_or(DfsError::Unknown))
     }
 
     pub async fn lookup_metadata(&self, path: &str) -> Result<FileMetadata, DfsError> {
@@ -268,7 +268,7 @@ impl ConnectionManager {
         }
 
         let mut successful_writes = 0;
-        let required_writes = (metadata.nodes.len() + 1) / 2;
+        let required_writes = metadata.nodes.len().div_ceil(2);
         let mut errors = Vec::new();
 
         let mut write_tasks = Vec::new();
@@ -489,7 +489,10 @@ async fn recv_response(stream: &mut TcpStream) -> Result<Response, DfsError> {
 
     if len > 100 * 1024 * 1024 {
         // Sanity check: 100MB max
-        return Err(DfsError::Network(format!("Response too large: {} bytes", len)));
+        return Err(DfsError::Network(format!(
+            "Response too large: {} bytes",
+            len
+        )));
     }
 
     let mut buf = vec![0u8; len];

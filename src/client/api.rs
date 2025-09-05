@@ -1,7 +1,7 @@
 use crate::client::{
     connection::{ConnectionManager, ConnectionStatsSnapshot, FileInfo},
+    error::DfsError,
     file::DfsFile,
-    error::DfsError
 };
 
 #[derive(Clone)]

@@ -1,4 +1,7 @@
-use crate::client::{connection::{ConnectionManager, FileMetadata}, error::DfsError};
+use crate::client::{
+    connection::{ConnectionManager, FileMetadata},
+    error::DfsError,
+};
 
 pub struct DfsFile {
     path: String,
@@ -8,7 +11,11 @@ pub struct DfsFile {
 
 impl DfsFile {
     pub fn new(path: String, metadata: FileMetadata, conn: ConnectionManager) -> Self {
-        Self { path, metadata, conn }
+        Self {
+            path,
+            metadata,
+            conn,
+        }
     }
 
     pub async fn read_block(&self, block_id: u64) -> Result<Vec<u8>, DfsError> {

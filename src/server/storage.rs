@@ -1,6 +1,6 @@
 use crate::client::connection::{Request, Response};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::fs::{self, File};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -71,7 +71,7 @@ impl StorageNode {
 
     async fn register_with_master(&self) -> tokio::io::Result<()> {
         let mut stream = TcpStream::connect(&self.master_addr).await?;
-        
+
         let registration = serde_json::json!({
             "type": "register_node",
             "node_id": self.id,
@@ -151,7 +151,7 @@ async fn handle_read_block(
     block_id: u64,
 ) -> Response {
     let blocks_guard = blocks.read().await;
-    
+
     if let Some(block) = blocks_guard.get(&block_id) {
         if let Ok(mut file) = File::open(&block.path).await {
             let mut data = Vec::new();
@@ -168,13 +168,13 @@ async fn handle_read_block(
 
 async fn handle_write_block(
     blocks: &Arc<RwLock<HashMap<u64, BlockStorage>>>,
-    data_dir: &PathBuf,
+    data_dir: &Path,
     used: &Arc<RwLock<u64>>,
     block_id: u64,
     data: Vec<u8>,
 ) -> Response {
     let block_path = data_dir.join(format!("block_{}.dat", block_id));
-    
+
     if let Ok(mut file) = File::create(&block_path).await {
         if file.write_all(&data).await.is_ok() {
             let checksum = calculate_checksum(&data);
@@ -206,8 +206,9 @@ async fn handle_write_block(
 fn calculate_checksum(data: &[u8]) -> String {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
-    
+
     let mut hasher = DefaultHasher::new();
     data.hash(&mut hasher);
     format!("{:x}", hasher.finish())
 }
+
