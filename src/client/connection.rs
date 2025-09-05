@@ -336,6 +336,61 @@ impl ConnectionManager {
         }
     }
 
+    pub async fn create_file(&self, path: &str) -> Result<FileMetadata, DfsError> {
+        self.execute_with_retry(&self.master_addr, |mut stream| {
+            let path = path.to_string();
+            Box::pin(async move {
+                let request = Request::Create { path };
+                send_request(&mut stream, &request).await?;
+                let response: Response = recv_response(&mut stream).await?;
+
+                match response {
+                    Response::Metadata { metadata } => Ok((stream, metadata)),
+                    Response::Error { message } => Err(DfsError::Network(message)),
+                    _ => Err(DfsError::Unknown),
+                }
+            })
+        })
+        .await
+    }
+
+    pub async fn list_files(&self, path: &str) -> Result<Vec<FileInfo>, DfsError> {
+        self.execute_with_retry(&self.master_addr, |mut stream| {
+            let path = path.to_string();
+            Box::pin(async move {
+                let request = Request::List { path };
+                send_request(&mut stream, &request).await?;
+                let response: Response = recv_response(&mut stream).await?;
+
+                match response {
+                    Response::FileList { files } => Ok((stream, files)),
+                    Response::Error { message } => Err(DfsError::Network(message)),
+                    _ => Err(DfsError::Unknown),
+                }
+            })
+        })
+        .await
+    }
+
+    pub async fn rename_file(&self, from: &str, to: &str) -> Result<(), DfsError> {
+        self.execute_with_retry(&self.master_addr, |mut stream| {
+            let from = from.to_string();
+            let to = to.to_string();
+            Box::pin(async move {
+                let request = Request::Rename { from, to };
+                send_request(&mut stream, &request).await?;
+                let response: Response = recv_response(&mut stream).await?;
+
+                match response {
+                    Response::Ok => Ok((stream, ())),
+                    Response::Error { message } => Err(DfsError::Network(message)),
+                    _ => Err(DfsError::Unknown),
+                }
+            })
+        })
+        .await
+    }
+
     pub async fn delete_file(&self, path: &str) -> Result<(), DfsError> {
         self.execute_with_retry(&self.master_addr, |mut stream| {
             let path = path.to_string();
@@ -378,9 +433,12 @@ pub struct ConnectionStatsSnapshot {
 #[derive(Debug, Serialize, Deserialize)]
 pub enum Request {
     Lookup { path: String },
+    Create { path: String },
+    List { path: String },
     ReadBlock { block_id: u64 },
     WriteBlock { block_id: u64, data: Vec<u8> },
     Delete { path: String },
+    Rename { from: String, to: String },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -389,6 +447,16 @@ pub enum Response {
     Error { message: String },
     Metadata { metadata: FileMetadata },
     BlockData { data: Vec<u8> },
+    FileList { files: Vec<FileInfo> },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileInfo {
+    pub path: String,
+    pub size: u64,
+    pub is_dir: bool,
+    pub created_at: u64,
+    pub modified_at: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
