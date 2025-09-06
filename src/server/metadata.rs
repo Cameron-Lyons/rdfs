@@ -111,6 +111,26 @@ impl MetadataStore {
         }
     }
 
+    pub async fn list_files(&self, _path: &str) -> Vec<FileInfo> {
+        let files = self.files.read().await;
+        files.values().cloned().collect()
+    }
+
+    pub async fn rename_file(&self, from: &str, to: &str) -> bool {
+        let mut files = self.files.write().await;
+        if let Some(mut file_info) = files.remove(from) {
+            file_info.path = to.to_string();
+            file_info.modified_at = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+            files.insert(to.to_string(), file_info);
+            true
+        } else {
+            false
+        }
+    }
+
     pub async fn allocate_block(&self, file_path: &str) -> Option<u64> {
         let mut files = self.files.write().await;
         if let Some(file_info) = files.get_mut(file_path) {
