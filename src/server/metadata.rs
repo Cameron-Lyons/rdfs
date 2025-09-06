@@ -71,7 +71,6 @@ impl Default for MetadataStore {
 }
 
 impl MetadataStore {
-
     pub async fn create_file(&self, path: String, replication_factor: usize) -> FileInfo {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -81,7 +80,7 @@ impl MetadataStore {
         let file_info = FileInfo {
             path: path.clone(),
             size: 0,
-            block_size: 4 * 1024 * 1024, // 4MB blocks
+            block_size: 4 * 1024 * 1024,
             blocks: Vec::new(),
             replication_factor,
             created_at: now,
@@ -239,4 +238,3 @@ impl MetadataStore {
         false
     }
 }
-

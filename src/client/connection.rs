@@ -488,7 +488,6 @@ async fn recv_response(stream: &mut TcpStream) -> Result<Response, DfsError> {
     let len = u32::from_be_bytes(len_buf) as usize;
 
     if len > 100 * 1024 * 1024 {
-        // Sanity check: 100MB max
         return Err(DfsError::Network(format!(
             "Response too large: {} bytes",
             len

@@ -34,7 +34,7 @@ impl StorageNode {
             master_addr,
             data_dir,
             blocks: Arc::new(RwLock::new(HashMap::new())),
-            capacity: 100 * 1024 * 1024 * 1024, // 100GB default
+            capacity: 100 * 1024 * 1024 * 1024,
             used: Arc::new(RwLock::new(0)),
         }
     }
@@ -211,4 +211,3 @@ fn calculate_checksum(data: &[u8]) -> String {
     data.hash(&mut hasher);
     format!("{:x}", hasher.finish())
 }
-

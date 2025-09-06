@@ -46,7 +46,10 @@ impl ReplicationManager {
             let metadata_store = Arc::clone(&self.metadata_store);
 
             let task = tokio::spawn(async move {
-                if write_to_node(&node_clone, block_id, &data_clone).await.is_ok() {
+                if write_to_node(&node_clone, block_id, &data_clone)
+                    .await
+                    .is_ok()
+                {
                     metadata_store
                         .update_block_replicas(&file_path_clone, block_id, node_clone.id.clone())
                         .await;
@@ -205,4 +208,3 @@ async fn read_from_node(node_addr: &str, block_id: u64) -> Result<Vec<u8>, Strin
         _ => Err("Unexpected response".to_string()),
     }
 }
-

@@ -82,7 +82,6 @@ async fn handle_client(
     let mut buf = vec![0u8; len];
     socket.read_exact(&mut buf).await?;
 
-    // First try to parse as a node message
     if let Ok(node_msg) = serde_json::from_slice::<serde_json::Value>(&buf) {
         if let Some(msg_type) = node_msg.get("type").and_then(|v| v.as_str()) {
             match msg_type {
@@ -110,7 +109,6 @@ async fn handle_client(
         }
     }
 
-    // Otherwise, try to parse as a regular Request
     let request: Request = serde_json::from_slice(&buf)?;
     println!("Received request: {:?}", request);
 
@@ -195,7 +193,7 @@ async fn handle_lookup(metadata_store: &Arc<MetadataStore>, path: &str) -> Respo
 
 async fn handle_create(metadata_store: &Arc<MetadataStore>, path: &str) -> Response {
     let file_info = metadata_store.create_file(path.to_string(), 3).await;
-    
+
     let active_nodes = metadata_store.get_active_nodes().await;
     let storage_nodes: Vec<StorageNode> = active_nodes
         .iter()
@@ -205,29 +203,29 @@ async fn handle_create(metadata_store: &Arc<MetadataStore>, path: &str) -> Respo
             addr: node.addr.clone(),
         })
         .collect();
-    
+
     if storage_nodes.is_empty() {
         metadata_store.delete_file(path).await;
         return Response::Error {
             message: "No storage nodes available".to_string(),
         };
     }
-    
+
     let block_id = metadata_store.allocate_block(path).await.unwrap_or(1);
-    
+
     for node in &storage_nodes {
         metadata_store
             .update_block_replicas(path, block_id, node.id.clone())
             .await;
     }
-    
+
     let metadata = FileMetadata {
         path: file_info.path,
         size: file_info.size,
         blocks: vec![block_id],
         nodes: storage_nodes,
     };
-    
+
     Response::Metadata { metadata }
 }
 
@@ -243,7 +241,7 @@ async fn handle_list(metadata_store: &Arc<MetadataStore>, path: &str) -> Respons
             modified_at: f.modified_at,
         })
         .collect();
-    
+
     Response::FileList { files: file_list }
 }
 
@@ -266,4 +264,3 @@ async fn handle_delete(metadata_store: &Arc<MetadataStore>, path: &str) -> Respo
         }
     }
 }
-
