@@ -31,4 +31,3 @@ async fn main() {
         eprintln!("Storage node error: {}", e);
     }
 }
-

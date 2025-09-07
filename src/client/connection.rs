@@ -2,24 +2,95 @@ use crate::client::error::DfsError;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
-    sync::{Mutex, RwLock},
+    sync::{Mutex, RwLock, Semaphore},
     time::{sleep, timeout},
 };
 
 const CONNECTION_TIMEOUT: Duration = Duration::from_secs(5);
 const RETRY_ATTEMPTS: u32 = 3;
 const RETRY_DELAY: Duration = Duration::from_millis(500);
+const MAX_CONNECTIONS_PER_HOST: usize = 10;
+const CIRCUIT_BREAKER_THRESHOLD: u64 = 5;
+const CIRCUIT_BREAKER_RESET_TIME: Duration = Duration::from_secs(30);
 
 type ConnectionMap = Arc<RwLock<HashMap<String, Arc<Mutex<Option<TcpStream>>>>>>;
+
+#[derive(Clone)]
+struct CircuitBreaker {
+    failure_count: Arc<AtomicU64>,
+    last_failure_time: Arc<RwLock<Option<SystemTime>>>,
+    state: Arc<RwLock<CircuitState>>,
+}
+
+#[derive(Clone, Debug)]
+enum CircuitState {
+    Closed,
+    Open,
+    HalfOpen,
+}
+
+impl CircuitBreaker {
+    fn new() -> Self {
+        Self {
+            failure_count: Arc::new(AtomicU64::new(0)),
+            last_failure_time: Arc::new(RwLock::new(None)),
+            state: Arc::new(RwLock::new(CircuitState::Closed)),
+        }
+    }
+
+    async fn record_success(&self) {
+        self.failure_count.store(0, Ordering::SeqCst);
+        *self.state.write().await = CircuitState::Closed;
+        *self.last_failure_time.write().await = None;
+    }
+
+    async fn record_failure(&self) {
+        let failures = self.failure_count.fetch_add(1, Ordering::SeqCst) + 1;
+        *self.last_failure_time.write().await = Some(SystemTime::now());
+
+        if failures >= CIRCUIT_BREAKER_THRESHOLD {
+            *self.state.write().await = CircuitState::Open;
+        }
+    }
+
+    async fn can_attempt(&self) -> bool {
+        let state = self.state.read().await;
+        match *state {
+            CircuitState::Closed => true,
+            CircuitState::Open => {
+                if let Some(last_failure) = *self.last_failure_time.read().await {
+                    if SystemTime::now()
+                        .duration_since(last_failure)
+                        .unwrap_or(Duration::ZERO)
+                        > CIRCUIT_BREAKER_RESET_TIME
+                    {
+                        drop(state);
+                        *self.state.write().await = CircuitState::HalfOpen;
+                        true
+                    } else {
+                        false
+                    }
+                } else {
+                    true
+                }
+            }
+            CircuitState::HalfOpen => true,
+        }
+    }
+}
 
 #[derive(Clone)]
 struct ConnectionPool {
     connections: ConnectionMap,
     last_used: Arc<RwLock<HashMap<String, u64>>>,
+    semaphores: Arc<RwLock<HashMap<String, Arc<Semaphore>>>>,
+    circuit_breakers: Arc<RwLock<HashMap<String, CircuitBreaker>>>,
+    active_connections: Arc<AtomicUsize>,
 }
 
 impl ConnectionPool {
@@ -27,10 +98,37 @@ impl ConnectionPool {
         Self {
             connections: Arc::new(RwLock::new(HashMap::new())),
             last_used: Arc::new(RwLock::new(HashMap::new())),
+            semaphores: Arc::new(RwLock::new(HashMap::new())),
+            circuit_breakers: Arc::new(RwLock::new(HashMap::new())),
+            active_connections: Arc::new(AtomicUsize::new(0)),
         }
     }
 
     async fn get_connection(&self, addr: &str) -> Result<TcpStream, DfsError> {
+        {
+            let breakers = self.circuit_breakers.read().await;
+            if let Some(breaker) = breakers.get(addr) {
+                if !breaker.can_attempt().await {
+                    return Err(DfsError::Network(format!(
+                        "Circuit breaker open for {}",
+                        addr
+                    )));
+                }
+            }
+        }
+
+        let semaphore = {
+            let mut semaphores = self.semaphores.write().await;
+            semaphores
+                .entry(addr.to_string())
+                .or_insert_with(|| Arc::new(Semaphore::new(MAX_CONNECTIONS_PER_HOST)))
+                .clone()
+        };
+
+        let _permit = semaphore.acquire().await.map_err(|e| {
+            DfsError::Network(format!("Failed to acquire connection permit: {}", e))
+        })?;
+
         {
             let connections = self.connections.read().await;
             if let Some(conn_mutex) = connections.get(addr) {
@@ -44,15 +142,45 @@ impl ConnectionPool {
                             .unwrap()
                             .as_secs(),
                     );
+                    self.active_connections.fetch_add(1, Ordering::SeqCst);
                     return Ok(conn);
                 }
             }
         }
 
-        let stream = timeout(CONNECTION_TIMEOUT, TcpStream::connect(addr))
-            .await
-            .map_err(|_| DfsError::Network(format!("Connection timeout to {}", addr)))?
-            .map_err(|e| DfsError::Network(format!("Failed to connect to {}: {}", addr, e)))?;
+        let stream = match timeout(CONNECTION_TIMEOUT, TcpStream::connect(addr)).await {
+            Ok(Ok(stream)) => {
+                let mut breakers = self.circuit_breakers.write().await;
+                let breaker = breakers
+                    .entry(addr.to_string())
+                    .or_insert_with(CircuitBreaker::new);
+                breaker.record_success().await;
+                stream
+            }
+            Ok(Err(e)) => {
+                let mut breakers = self.circuit_breakers.write().await;
+                let breaker = breakers
+                    .entry(addr.to_string())
+                    .or_insert_with(CircuitBreaker::new);
+                breaker.record_failure().await;
+                return Err(DfsError::Network(format!(
+                    "Failed to connect to {}: {}",
+                    addr, e
+                )));
+            }
+            Err(_) => {
+                let mut breakers = self.circuit_breakers.write().await;
+                let breaker = breakers
+                    .entry(addr.to_string())
+                    .or_insert_with(CircuitBreaker::new);
+                breaker.record_failure().await;
+                return Err(DfsError::Network(format!("Connection timeout to {}", addr)));
+            }
+        };
+
+        stream
+            .set_nodelay(true)
+            .map_err(|e| DfsError::Network(format!("Failed to set TCP no-delay: {}", e)))?;
 
         let mut connections = self.connections.write().await;
         connections.insert(addr.to_string(), Arc::new(Mutex::new(None)));
@@ -66,6 +194,7 @@ impl ConnectionPool {
                 .as_secs(),
         );
 
+        self.active_connections.fetch_add(1, Ordering::SeqCst);
         Ok(stream)
     }
 
@@ -75,6 +204,7 @@ impl ConnectionPool {
             let mut conn_opt = conn_mutex.lock().await;
             *conn_opt = Some(conn);
         }
+        self.active_connections.fetch_sub(1, Ordering::SeqCst);
     }
 
     async fn cleanup_stale_connections(&self) {
@@ -86,7 +216,7 @@ impl ConnectionPool {
         let last_used = self.last_used.read().await;
         let stale_addrs: Vec<String> = last_used
             .iter()
-            .filter(|(_, &last)| now - last > 60)
+            .filter(|(_, last)| now - **last > 60)
             .map(|(addr, _)| addr.clone())
             .collect();
 
@@ -105,10 +235,78 @@ impl ConnectionPool {
 }
 
 #[derive(Clone)]
+struct BlockCache {
+    cache: Arc<RwLock<HashMap<u64, CachedBlock>>>,
+    max_size: usize,
+    current_size: Arc<AtomicUsize>,
+}
+
+#[derive(Clone)]
+struct CachedBlock {
+    data: Vec<u8>,
+    last_accessed: SystemTime,
+    access_count: u64,
+}
+
+impl BlockCache {
+    fn new(max_size_mb: usize) -> Self {
+        Self {
+            cache: Arc::new(RwLock::new(HashMap::new())),
+            max_size: max_size_mb * 1024 * 1024,
+            current_size: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    async fn get(&self, block_id: u64) -> Option<Vec<u8>> {
+        let mut cache = self.cache.write().await;
+        if let Some(block) = cache.get_mut(&block_id) {
+            block.last_accessed = SystemTime::now();
+            block.access_count += 1;
+            Some(block.data.clone())
+        } else {
+            None
+        }
+    }
+
+    async fn put(&self, block_id: u64, data: Vec<u8>) {
+        let data_size = data.len();
+
+        while self.current_size.load(Ordering::SeqCst) + data_size > self.max_size {
+            self.evict_lru().await;
+        }
+
+        let mut cache = self.cache.write().await;
+        cache.insert(
+            block_id,
+            CachedBlock {
+                data,
+                last_accessed: SystemTime::now(),
+                access_count: 1,
+            },
+        );
+
+        self.current_size.fetch_add(data_size, Ordering::SeqCst);
+    }
+
+    async fn evict_lru(&self) {
+        let mut cache = self.cache.write().await;
+        if let Some((oldest_id, oldest_block)) =
+            cache.iter().min_by_key(|(_, block)| block.last_accessed)
+        {
+            let oldest_id = *oldest_id;
+            let size = oldest_block.data.len();
+            cache.remove(&oldest_id);
+            self.current_size.fetch_sub(size, Ordering::SeqCst);
+        }
+    }
+}
+
+#[derive(Clone)]
 pub struct ConnectionManager {
     master_addr: String,
     connection_pool: ConnectionPool,
     connection_stats: Arc<RwLock<ConnectionStats>>,
+    block_cache: BlockCache,
 }
 
 #[derive(Default)]
@@ -133,6 +331,7 @@ impl ConnectionManager {
             master_addr: master_addr.to_string(),
             connection_pool,
             connection_stats: Arc::new(RwLock::new(ConnectionStats::default())),
+            block_cache: BlockCache::new(100),
         };
 
         let pool = manager.connection_pool.clone();
@@ -210,6 +409,13 @@ impl ConnectionManager {
         metadata: &FileMetadata,
         block_id: u64,
     ) -> Result<Vec<u8>, DfsError> {
+        if let Some(data) = self.block_cache.get(block_id).await {
+            let mut stats = self.connection_stats.write().await;
+            stats.total_requests += 1;
+            stats.bytes_received += data.len() as u64;
+            return Ok(data);
+        }
+
         if metadata.nodes.is_empty() {
             return Err(DfsError::Network("No storage nodes available".into()));
         }
@@ -234,6 +440,8 @@ impl ConnectionManager {
                 .await
             {
                 Ok(data) => {
+                    self.block_cache.put(block_id, data.clone()).await;
+
                     let mut stats = self.connection_stats.write().await;
                     stats.total_requests += 1;
                     stats.bytes_received += data.len() as u64;
@@ -474,15 +682,47 @@ pub struct StorageNode {
 }
 
 async fn send_request(stream: &mut TcpStream, req: &Request) -> Result<(), DfsError> {
-    let msg = serde_json::to_vec(req).map_err(|e| DfsError::Network(e.to_string()))?;
-    let len = (msg.len() as u32).to_be_bytes();
+    use flate2::Compression;
+    use flate2::write::GzEncoder;
+    use std::io::Write;
+
+    let msg = bincode::serialize(req).map_err(|e| DfsError::Network(e.to_string()))?;
+
+    let (compressed, is_compressed) = if msg.len() > 1024 {
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
+        encoder
+            .write_all(&msg)
+            .map_err(|e| DfsError::Network(e.to_string()))?;
+        let compressed = encoder
+            .finish()
+            .map_err(|e| DfsError::Network(e.to_string()))?;
+        let is_compressed = compressed.len() < msg.len();
+        if is_compressed {
+            (compressed, true)
+        } else {
+            (msg, false)
+        }
+    } else {
+        (msg, false)
+    };
+
+    let flags: u8 = if is_compressed { 1 } else { 0 };
+    let len = (compressed.len() as u32).to_be_bytes();
+
+    stream.write_all(&[flags]).await?;
     stream.write_all(&len).await?;
-    stream.write_all(&msg).await?;
+    stream.write_all(&compressed).await?;
     stream.flush().await?;
     Ok(())
 }
 
 async fn recv_response(stream: &mut TcpStream) -> Result<Response, DfsError> {
+    use flate2::read::GzDecoder;
+    use std::io::Read;
+
+    let mut flags = [0u8; 1];
+    stream.read_exact(&mut flags).await?;
+
     let mut len_buf = [0u8; 4];
     stream.read_exact(&mut len_buf).await?;
     let len = u32::from_be_bytes(len_buf) as usize;
@@ -496,7 +736,19 @@ async fn recv_response(stream: &mut TcpStream) -> Result<Response, DfsError> {
 
     let mut buf = vec![0u8; len];
     stream.read_exact(&mut buf).await?;
+
+    let data = if flags[0] & 1 != 0 {
+        let mut decoder = GzDecoder::new(&buf[..]);
+        let mut decompressed = Vec::new();
+        decoder
+            .read_to_end(&mut decompressed)
+            .map_err(|e| DfsError::Network(format!("Decompression failed: {}", e)))?;
+        decompressed
+    } else {
+        buf
+    };
+
     let resp: Response =
-        serde_json::from_slice(&buf).map_err(|e| DfsError::Network(e.to_string()))?;
+        bincode::deserialize(&data).map_err(|e| DfsError::Network(e.to_string()))?;
     Ok(resp)
 }

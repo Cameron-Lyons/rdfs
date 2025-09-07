@@ -1,14 +1,16 @@
 [package]
 name = "rdfs"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 
 [dependencies]
-tokio = { version = "1.32", features = ["full"] }
+tokio = { version = "1.47.1", features = ["full"] }
 thiserror = "2.0.16"
-async-trait = "0.1"
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
+async-trait = "0.1.89"
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0.143"
+flate2 = "1.1.2"
+bincode = "2.0.1"
 
 [[bin]]
 name = "master"

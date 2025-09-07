@@ -2,6 +2,11 @@
 
 A high-performance distributed file system implementation in Rust featuring automatic replication, fault tolerance, and strong consistency guarantees.
 
+## Recent Updates
+- Removed all code comments for cleaner codebase
+- Optimized connection pooling with circuit breaker pattern
+- Enhanced performance with block caching and compression
+
 ## Overview
 
 RDFS provides a scalable, fault-tolerant distributed storage solution with automatic data replication across multiple nodes. The system handles node failures gracefully and ensures data availability through configurable replication factors.
