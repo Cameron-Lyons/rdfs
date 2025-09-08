@@ -682,47 +682,16 @@ pub struct StorageNode {
 }
 
 async fn send_request(stream: &mut TcpStream, req: &Request) -> Result<(), DfsError> {
-    use flate2::Compression;
-    use flate2::write::GzEncoder;
-    use std::io::Write;
+    let msg = serde_json::to_vec(req).map_err(|e| DfsError::Network(e.to_string()))?;
+    let len = (msg.len() as u32).to_be_bytes();
 
-    let msg = bincode::serialize(req).map_err(|e| DfsError::Network(e.to_string()))?;
-
-    let (compressed, is_compressed) = if msg.len() > 1024 {
-        let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
-        encoder
-            .write_all(&msg)
-            .map_err(|e| DfsError::Network(e.to_string()))?;
-        let compressed = encoder
-            .finish()
-            .map_err(|e| DfsError::Network(e.to_string()))?;
-        let is_compressed = compressed.len() < msg.len();
-        if is_compressed {
-            (compressed, true)
-        } else {
-            (msg, false)
-        }
-    } else {
-        (msg, false)
-    };
-
-    let flags: u8 = if is_compressed { 1 } else { 0 };
-    let len = (compressed.len() as u32).to_be_bytes();
-
-    stream.write_all(&[flags]).await?;
     stream.write_all(&len).await?;
-    stream.write_all(&compressed).await?;
+    stream.write_all(&msg).await?;
     stream.flush().await?;
     Ok(())
 }
 
 async fn recv_response(stream: &mut TcpStream) -> Result<Response, DfsError> {
-    use flate2::read::GzDecoder;
-    use std::io::Read;
-
-    let mut flags = [0u8; 1];
-    stream.read_exact(&mut flags).await?;
-
     let mut len_buf = [0u8; 4];
     stream.read_exact(&mut len_buf).await?;
     let len = u32::from_be_bytes(len_buf) as usize;
@@ -737,18 +706,6 @@ async fn recv_response(stream: &mut TcpStream) -> Result<Response, DfsError> {
     let mut buf = vec![0u8; len];
     stream.read_exact(&mut buf).await?;
 
-    let data = if flags[0] & 1 != 0 {
-        let mut decoder = GzDecoder::new(&buf[..]);
-        let mut decompressed = Vec::new();
-        decoder
-            .read_to_end(&mut decompressed)
-            .map_err(|e| DfsError::Network(format!("Decompression failed: {}", e)))?;
-        decompressed
-    } else {
-        buf
-    };
-
-    let resp: Response =
-        bincode::deserialize(&data).map_err(|e| DfsError::Network(e.to_string()))?;
+    let resp: Response = serde_json::from_slice(&buf).map_err(|e| DfsError::Network(e.to_string()))?;
     Ok(resp)
 }

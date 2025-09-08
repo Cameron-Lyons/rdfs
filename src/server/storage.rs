@@ -119,29 +119,37 @@ async fn handle_storage_request(
     data_dir: PathBuf,
     used: Arc<RwLock<u64>>,
 ) -> tokio::io::Result<()> {
-    let mut len_buf = [0u8; 4];
-    socket.read_exact(&mut len_buf).await?;
-    let len = u32::from_be_bytes(len_buf) as usize;
-
-    let mut buf = vec![0u8; len];
-    socket.read_exact(&mut buf).await?;
-
-    let request: Request = serde_json::from_slice(&buf)?;
-
-    let response = match request {
-        Request::ReadBlock { block_id } => handle_read_block(&blocks, block_id).await,
-        Request::WriteBlock { block_id, data } => {
-            handle_write_block(&blocks, &data_dir, &used, block_id, data).await
+    loop {
+        let mut len_buf = [0u8; 4];
+        match socket.read_exact(&mut len_buf).await {
+            Ok(_) => {},
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                break;
+            }
+            Err(e) => return Err(e),
         }
-        _ => Response::Error {
-            message: "Invalid request for storage node".to_string(),
-        },
-    };
+        let len = u32::from_be_bytes(len_buf) as usize;
 
-    let response_bytes = serde_json::to_vec(&response)?;
-    let len = (response_bytes.len() as u32).to_be_bytes();
-    socket.write_all(&len).await?;
-    socket.write_all(&response_bytes).await?;
+        let mut buf = vec![0u8; len];
+        socket.read_exact(&mut buf).await?;
+
+        let request: Request = serde_json::from_slice(&buf)?;
+
+        let response = match request {
+            Request::ReadBlock { block_id } => handle_read_block(&blocks, block_id).await,
+            Request::WriteBlock { block_id, data } => {
+                handle_write_block(&blocks, &data_dir, &used, block_id, data).await
+            }
+            _ => Response::Error {
+                message: "Invalid request for storage node".to_string(),
+            },
+        };
+
+        let response_bytes = serde_json::to_vec(&response)?;
+        let len = (response_bytes.len() as u32).to_be_bytes();
+        socket.write_all(&len).await?;
+        socket.write_all(&response_bytes).await?;
+    }
 
     Ok(())
 }
