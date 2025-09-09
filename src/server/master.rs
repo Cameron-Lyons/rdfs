@@ -29,6 +29,14 @@ impl MasterServer {
         tokio::spawn(async move {
             Self::monitor_node_health(metadata_store.clone()).await;
         });
+        
+        let health_addr = self.addr.clone().replace(":9000", ":9080");
+        let health_metadata_store = Arc::clone(&self.metadata_store);
+        tokio::spawn(async move {
+            if let Err(e) = Self::start_health_endpoint(&health_addr, health_metadata_store).await {
+                eprintln!("Failed to start health endpoint: {}", e);
+            }
+        });
 
         loop {
             let (socket, addr) = listener.accept().await?;
@@ -68,6 +76,70 @@ impl MasterServer {
             .await;
         println!("Registered storage node: {}", node_id);
     }
+    
+    async fn start_health_endpoint(addr: &str, metadata_store: Arc<MetadataStore>) -> tokio::io::Result<()> {
+        let listener = TcpListener::bind(addr).await?;
+        println!("Health endpoint listening on {}", addr);
+        
+        loop {
+            let (mut socket, _) = listener.accept().await?;
+            let metadata_store = metadata_store.clone();
+            
+            tokio::spawn(async move {
+                let _ = handle_health_check(&mut socket, metadata_store).await;
+            });
+        }
+    }
+}
+
+async fn handle_health_check(socket: &mut TcpStream, metadata_store: Arc<MetadataStore>) -> tokio::io::Result<()> {
+    let mut buffer = [0; 1024];
+    let n = socket.read(&mut buffer).await?;
+    
+    if n > 0 {
+        let request = String::from_utf8_lossy(&buffer[..n]);
+        
+        if request.contains("GET /health") {
+            let nodes = metadata_store.get_active_nodes().await;
+            let files = metadata_store.list_files("/").await;
+            
+            let health_status = serde_json::json!({
+                "status": "healthy",
+                "timestamp": std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs(),
+                "metrics": {
+                    "active_storage_nodes": nodes.len(),
+                    "total_files": files.len(),
+                    "replication_factor": 3
+                },
+                "storage_nodes": nodes.iter().map(|n| {
+                    serde_json::json!({
+                        "id": n.id,
+                        "addr": n.addr,
+                        "capacity": n.capacity,
+                        "used": n.used,
+                        "status": format!("{:?}", n.status)
+                    })
+                }).collect::<Vec<_>>()
+            });
+            
+            let response_body = serde_json::to_string_pretty(&health_status)?;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                response_body.len(),
+                response_body
+            );
+            
+            socket.write_all(response.as_bytes()).await?;
+        } else {
+            let response = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
+            socket.write_all(response.as_bytes()).await?;
+        }
+    }
+    
+    Ok(())
 }
 
 async fn handle_client(

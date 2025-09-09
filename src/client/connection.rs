@@ -561,6 +561,24 @@ impl ConnectionManager {
         })
         .await
     }
+    
+    pub async fn create_file_with_replication(&self, path: &str, replication_factor: usize) -> Result<FileMetadata, DfsError> {
+        self.execute_with_retry(&self.master_addr, |mut stream| {
+            let path = path.to_string();
+            Box::pin(async move {
+                let request = Request::CreateWithReplication { path, replication_factor };
+                send_request(&mut stream, &request).await?;
+                let response: Response = recv_response(&mut stream).await?;
+
+                match response {
+                    Response::Metadata { metadata } => Ok((stream, metadata)),
+                    Response::Error { message } => Err(DfsError::Network(message)),
+                    _ => Err(DfsError::Unknown),
+                }
+            })
+        })
+        .await
+    }
 
     pub async fn list_files(&self, path: &str) -> Result<Vec<FileInfo>, DfsError> {
         self.execute_with_retry(&self.master_addr, |mut stream| {
@@ -642,6 +660,7 @@ pub struct ConnectionStatsSnapshot {
 pub enum Request {
     Lookup { path: String },
     Create { path: String },
+    CreateWithReplication { path: String, replication_factor: usize },
     List { path: String },
     ReadBlock { block_id: u64 },
     WriteBlock { block_id: u64, data: Vec<u8> },
