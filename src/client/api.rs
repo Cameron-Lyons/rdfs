@@ -40,9 +40,16 @@ impl DfsClient {
     pub async fn get_connection_stats(&self) -> ConnectionStatsSnapshot {
         self.conn.get_stats().await
     }
-    
-    pub async fn create_with_replication(&self, path: &str, replication_factor: usize) -> Result<DfsFile, DfsError> {
-        let metadata = self.conn.create_file_with_replication(path, replication_factor).await?;
+
+    pub async fn create_with_replication(
+        &self,
+        path: &str,
+        replication_factor: usize,
+    ) -> Result<DfsFile, DfsError> {
+        let metadata = self
+            .conn
+            .create_file_with_replication(path, replication_factor)
+            .await?;
         Ok(DfsFile::new(path.to_string(), metadata, self.conn.clone()))
     }
 }

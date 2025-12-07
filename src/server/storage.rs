@@ -122,7 +122,7 @@ async fn handle_storage_request(
     loop {
         let mut len_buf = [0u8; 4];
         match socket.read_exact(&mut len_buf).await {
-            Ok(_) => {},
+            Ok(_) => {}
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
                 break;
             }
