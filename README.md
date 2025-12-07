@@ -6,6 +6,7 @@ A high-performance distributed file system implementation in Rust featuring auto
 - Removed all code comments for cleaner codebase
 - Optimized connection pooling with circuit breaker pattern
 - Enhanced performance with block caching and compression
+- Comprehensive test suite with unit and integration tests
 
 ## Overview
 
@@ -75,7 +76,7 @@ This script:
 1. Builds the project
 2. Starts master server on port 9000
 3. Launches 3 storage nodes (ports 9001-9003)
-4. Runs client demo operations
+4. Runs client operations (`src/main.rs`)
 5. Cleanly shuts down all components
 
 ### Manual Setup
@@ -141,7 +142,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     client.delete("/data/renamed.txt").await?;
     
     // Get statistics
-    let stats = client.stats().await;
+    let stats = client.get_connection_stats().await;
     println!("Total requests: {}", stats.total_requests);
     
     Ok(())
@@ -163,7 +164,7 @@ let blocks = vec![
 file.write_blocks(blocks).await?;
 
 // Streaming large files
-let mut stream = file.stream_read().await?;
+let mut stream = file.stream_read();
 while let Some(chunk) = stream.next().await {
     process_chunk(chunk?);
 }
@@ -178,29 +179,48 @@ cargo test --lib
 
 ### Integration Tests
 ```bash
-cargo test --test '*'
+cargo test --test integration_test
+```
+
+### Run All Tests
+```bash
+cargo test
 ```
 
 ### Stress Testing
 ```bash
-cargo run --release --bin stress_test -- --nodes 10 --files 1000
+cargo run --release --bin stress_test
 ```
 
 ## Configuration
 
-### Master Server Options
-- `--port`: Listen port (default: 9000)
-- `--replication`: Default replication factor (default: 3)
-- `--block-size`: Block size in MB (default: 4)
+### Master Server
+The master server accepts an optional address argument:
+```bash
+cargo run --release --bin master -- [ADDRESS]
+```
+- Default address: `127.0.0.1:9000`
+- Default replication factor: 3
+- Block size: 4MB
 
-### Storage Node Options
-- `--capacity`: Storage capacity in GB (default: 100)
-- `--heartbeat`: Heartbeat interval in seconds (default: 10)
+### Storage Node
+The storage node requires positional arguments:
+```bash
+cargo run --release --bin storage -- <node_id> <listen_addr> [master_addr] [data_dir]
+```
+- `node_id`: Unique identifier for the storage node (required)
+- `listen_addr`: Address for incoming connections (required)
+- `master_addr`: Master server address (default: `127.0.0.1:9000`)
+- `data_dir`: Local directory for block storage (default: `./data/<node_id>`)
+- Default capacity: 100GB
+- Heartbeat interval: 10 seconds
 
-### Client Options
-- `--timeout`: Connection timeout in seconds (default: 5)
-- `--retries`: Number of retry attempts (default: 3)
-- `--pool-size`: Connection pool size (default: 10)
+### Client Configuration
+The client uses the following defaults:
+- Connection timeout: 5 seconds
+- Retry attempts: 3
+- Connection pool size: 10 per host
+- Circuit breaker threshold: 5 failures
 
 ## Performance
 
@@ -261,55 +281,13 @@ Majority Ack ← Checksum Verify ← Write Complete
 
 ### Health Checks
 
+The health endpoint runs on port 9080 (master port + 80):
 ```bash
-curl http://127.0.0.1:9000/health
+curl http://127.0.0.1:9080/health
 ```
 
-## Development
-
-### Project Structure
-
-```
-rdfs/
-├── src/
-│   ├── bin/           # Binary entry points
-│   ├── client/        # Client library
-│   │   ├── api.rs     # Public API
-│   │   ├── connection.rs # Connection management
-│   │   ├── error.rs   # Error types
-│   │   └── file.rs    # File operations
-│   ├── server/        # Server components
-│   │   ├── master.rs  # Master server
-│   │   ├── storage.rs # Storage node
-│   │   ├── metadata.rs # Metadata store
-│   │   └── replication.rs # Replication logic
-│   └── lib.rs         # Library root
-├── tests/             # Integration tests
-├── benches/           # Performance benchmarks
-└── Cargo.toml         # Dependencies
-```
-
-### Contributing
-
-1. Fork the repository
-2. Create feature branch (`git checkout -b feature/amazing`)
-3. Commit changes (`git commit -am 'Add feature'`)
-4. Push branch (`git push origin feature/amazing`)
-5. Open Pull Request
+The health endpoint returns JSON with system status, active nodes, and file counts.
 
 ## License
 
 MIT License - see LICENSE file for details
-
-## Acknowledgments
-
-Built with:
-- Tokio async runtime
-- Serde serialization
-- Rust standard library
-
-## Support
-
-- Issues: [GitHub Issues](https://github.com/yourusername/rdfs/issues)
-- Discussions: [GitHub Discussions](https://github.com/yourusername/rdfs/discussions)
-- Email: support@rdfs.example.com
