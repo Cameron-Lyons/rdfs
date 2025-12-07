@@ -46,35 +46,35 @@ impl DfsFile {
     pub fn get_metadata(&self) -> &FileMetadata {
         &self.metadata
     }
-    
+
     pub async fn write_blocks(&self, blocks: Vec<(u64, &[u8])>) -> Result<(), DfsError> {
         let mut results = Vec::new();
-        
+
         for (block_id, data) in blocks {
             results.push(self.write_block(block_id, data).await);
         }
-        
+
         for result in results {
             result?;
         }
-        
+
         Ok(())
     }
-    
+
     pub async fn read_blocks(&self, block_ids: Vec<u64>) -> Result<Vec<Vec<u8>>, DfsError> {
         let mut blocks = Vec::new();
-        
+
         for block_id in block_ids {
             blocks.push(self.read_block(block_id).await?);
         }
-        
+
         Ok(blocks)
     }
-    
+
     pub fn stream_read(&self) -> DfsFileStream {
         DfsFileStream::new(self.clone())
     }
-    
+
     pub fn stream_write(&self) -> DfsFileWriter {
         DfsFileWriter::new(self.clone())
     }
@@ -95,12 +95,12 @@ impl DfsFileStream {
             total_blocks,
         }
     }
-    
+
     pub async fn next(&mut self) -> Option<Result<Vec<u8>, DfsError>> {
         if self.current_block >= self.total_blocks {
             return None;
         }
-        
+
         let result = self.file.read_block(self.current_block).await;
         self.current_block += 1;
         Some(result)
@@ -119,7 +119,7 @@ impl DfsFileWriter {
             current_block: 0,
         }
     }
-    
+
     pub async fn write_chunk(&mut self, data: &[u8]) -> Result<(), DfsError> {
         let result = self.file.write_block(self.current_block, data).await;
         if result.is_ok() {

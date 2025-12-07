@@ -29,7 +29,7 @@ impl MasterServer {
         tokio::spawn(async move {
             Self::monitor_node_health(metadata_store.clone()).await;
         });
-        
+
         let health_addr = self.addr.clone().replace(":9000", ":9080");
         let health_metadata_store = Arc::clone(&self.metadata_store);
         tokio::spawn(async move {
@@ -76,15 +76,18 @@ impl MasterServer {
             .await;
         println!("Registered storage node: {}", node_id);
     }
-    
-    async fn start_health_endpoint(addr: &str, metadata_store: Arc<MetadataStore>) -> tokio::io::Result<()> {
+
+    async fn start_health_endpoint(
+        addr: &str,
+        metadata_store: Arc<MetadataStore>,
+    ) -> tokio::io::Result<()> {
         let listener = TcpListener::bind(addr).await?;
         println!("Health endpoint listening on {}", addr);
-        
+
         loop {
             let (mut socket, _) = listener.accept().await?;
             let metadata_store = metadata_store.clone();
-            
+
             tokio::spawn(async move {
                 let _ = handle_health_check(&mut socket, metadata_store).await;
             });
@@ -92,17 +95,20 @@ impl MasterServer {
     }
 }
 
-async fn handle_health_check(socket: &mut TcpStream, metadata_store: Arc<MetadataStore>) -> tokio::io::Result<()> {
+async fn handle_health_check(
+    socket: &mut TcpStream,
+    metadata_store: Arc<MetadataStore>,
+) -> tokio::io::Result<()> {
     let mut buffer = [0; 1024];
     let n = socket.read(&mut buffer).await?;
-    
+
     if n > 0 {
         let request = String::from_utf8_lossy(&buffer[..n]);
-        
+
         if request.contains("GET /health") {
             let nodes = metadata_store.get_active_nodes().await;
             let files = metadata_store.list_files("/").await;
-            
+
             let health_status = serde_json::json!({
                 "status": "healthy",
                 "timestamp": std::time::SystemTime::now()
@@ -124,21 +130,21 @@ async fn handle_health_check(socket: &mut TcpStream, metadata_store: Arc<Metadat
                     })
                 }).collect::<Vec<_>>()
             });
-            
+
             let response_body = serde_json::to_string_pretty(&health_status)?;
             let response = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
                 response_body.len(),
                 response_body
             );
-            
+
             socket.write_all(response.as_bytes()).await?;
         } else {
             let response = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
             socket.write_all(response.as_bytes()).await?;
         }
     }
-    
+
     Ok(())
 }
 

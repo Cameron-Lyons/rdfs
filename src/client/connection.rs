@@ -561,12 +561,19 @@ impl ConnectionManager {
         })
         .await
     }
-    
-    pub async fn create_file_with_replication(&self, path: &str, replication_factor: usize) -> Result<FileMetadata, DfsError> {
+
+    pub async fn create_file_with_replication(
+        &self,
+        path: &str,
+        replication_factor: usize,
+    ) -> Result<FileMetadata, DfsError> {
         self.execute_with_retry(&self.master_addr, |mut stream| {
             let path = path.to_string();
             Box::pin(async move {
-                let request = Request::CreateWithReplication { path, replication_factor };
+                let request = Request::CreateWithReplication {
+                    path,
+                    replication_factor,
+                };
                 send_request(&mut stream, &request).await?;
                 let response: Response = recv_response(&mut stream).await?;
 
@@ -658,14 +665,33 @@ pub struct ConnectionStatsSnapshot {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum Request {
-    Lookup { path: String },
-    Create { path: String },
-    CreateWithReplication { path: String, replication_factor: usize },
-    List { path: String },
-    ReadBlock { block_id: u64 },
-    WriteBlock { block_id: u64, data: Vec<u8> },
-    Delete { path: String },
-    Rename { from: String, to: String },
+    Lookup {
+        path: String,
+    },
+    Create {
+        path: String,
+    },
+    CreateWithReplication {
+        path: String,
+        replication_factor: usize,
+    },
+    List {
+        path: String,
+    },
+    ReadBlock {
+        block_id: u64,
+    },
+    WriteBlock {
+        block_id: u64,
+        data: Vec<u8>,
+    },
+    Delete {
+        path: String,
+    },
+    Rename {
+        from: String,
+        to: String,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -725,6 +751,7 @@ async fn recv_response(stream: &mut TcpStream) -> Result<Response, DfsError> {
     let mut buf = vec![0u8; len];
     stream.read_exact(&mut buf).await?;
 
-    let resp: Response = serde_json::from_slice(&buf).map_err(|e| DfsError::Network(e.to_string()))?;
+    let resp: Response =
+        serde_json::from_slice(&buf).map_err(|e| DfsError::Network(e.to_string()))?;
     Ok(resp)
 }
