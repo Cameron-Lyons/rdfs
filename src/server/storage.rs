@@ -1,4 +1,4 @@
-use crate::client::connection::{auth_token, Envelope, Request, Response};
+use crate::client::connection::{Envelope, Request, Response, auth_token};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -197,12 +197,12 @@ async fn handle_read_block(
 ) -> Response {
     let blocks_guard = blocks.read().await;
 
-    if let Some(block) = blocks_guard.get(&block_id) {
-        if let Ok(mut file) = File::open(&block.path).await {
-            let mut data = Vec::new();
-            if file.read_to_end(&mut data).await.is_ok() {
-                return Response::BlockData { data };
-            }
+    if let Some(block) = blocks_guard.get(&block_id)
+        && let Ok(mut file) = File::open(&block.path).await
+    {
+        let mut data = Vec::new();
+        if file.read_to_end(&mut data).await.is_ok() {
+            return Response::BlockData { data };
         }
     }
 
@@ -220,27 +220,27 @@ async fn handle_write_block(
 ) -> Response {
     let block_path = data_dir.join(format!("block_{}.dat", block_id));
 
-    if let Ok(mut file) = File::create(&block_path).await {
-        if file.write_all(&data).await.is_ok() {
-            let checksum = calculate_checksum(&data);
-            let size = data.len() as u64;
+    if let Ok(mut file) = File::create(&block_path).await
+        && file.write_all(&data).await.is_ok()
+    {
+        let checksum = calculate_checksum(&data);
+        let size = data.len() as u64;
 
-            let block_storage = BlockStorage {
-                _block_id: block_id,
-                _size: size,
-                path: block_path,
-                _checksum: checksum,
-                _version: 1,
-            };
+        let block_storage = BlockStorage {
+            _block_id: block_id,
+            _size: size,
+            path: block_path,
+            _checksum: checksum,
+            _version: 1,
+        };
 
-            let mut blocks_guard = blocks.write().await;
-            blocks_guard.insert(block_id, block_storage);
+        let mut blocks_guard = blocks.write().await;
+        blocks_guard.insert(block_id, block_storage);
 
-            let mut used_guard = used.write().await;
-            *used_guard += size;
+        let mut used_guard = used.write().await;
+        *used_guard += size;
 
-            return Response::Ok;
-        }
+        return Response::Ok;
     }
 
     Response::Error {

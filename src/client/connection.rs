@@ -1,12 +1,12 @@
 use crate::client::error::DfsError;
+use flate2::Compression;
 use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
-use flate2::Compression;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::{Read as IoRead, Write as IoWrite};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -111,13 +111,13 @@ impl ConnectionPool {
     async fn get_connection(&self, addr: &str) -> Result<TcpStream, DfsError> {
         {
             let breakers = self.circuit_breakers.read().await;
-            if let Some(breaker) = breakers.get(addr) {
-                if !breaker.can_attempt().await {
-                    return Err(DfsError::Network(format!(
-                        "Circuit breaker open for {}",
-                        addr
-                    )));
-                }
+            if let Some(breaker) = breakers.get(addr)
+                && !breaker.can_attempt().await
+            {
+                return Err(DfsError::Network(format!(
+                    "Circuit breaker open for {}",
+                    addr
+                )));
             }
         }
 

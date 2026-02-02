@@ -124,11 +124,11 @@ fn load_from_db(conn: &rusqlite::Connection) -> DbSnapshot {
             .query_map([], |row| {
                 Ok(FileInfo {
                     path: row.get(0)?,
-                    size: row.get(1)?,
-                    block_size: row.get(2)?,
-                    replication_factor: row.get(3)?,
-                    created_at: row.get(4)?,
-                    modified_at: row.get(5)?,
+                    size: row.get::<_, i64>(1)? as u64,
+                    block_size: row.get::<_, i64>(2)? as u64,
+                    replication_factor: row.get::<_, i64>(3)? as usize,
+                    created_at: row.get::<_, i64>(4)? as u64,
+                    modified_at: row.get::<_, i64>(5)? as u64,
                     blocks: Vec::new(),
                 })
             })
@@ -146,9 +146,9 @@ fn load_from_db(conn: &rusqlite::Connection) -> DbSnapshot {
         let rows = stmt
             .query_map([], |row| {
                 Ok((
-                    row.get::<_, u64>(0)?,
+                    row.get::<_, i64>(0)? as u64,
                     row.get::<_, String>(1)?,
-                    row.get::<_, u64>(2)?,
+                    row.get::<_, i64>(2)? as u64,
                     row.get::<_, String>(3)?,
                 ))
             })
@@ -176,10 +176,10 @@ fn load_from_db(conn: &rusqlite::Connection) -> DbSnapshot {
         let rows = stmt
             .query_map([], |row| {
                 Ok((
-                    row.get::<_, u64>(0)?,
+                    row.get::<_, i64>(0)? as u64,
                     row.get::<_, String>(1)?,
-                    row.get::<_, u64>(2)?,
-                    row.get::<_, u64>(3)?,
+                    row.get::<_, i64>(2)? as u64,
+                    row.get::<_, i64>(3)? as u64,
                 ))
             })
             .unwrap();
@@ -216,9 +216,9 @@ fn load_from_db(conn: &rusqlite::Connection) -> DbSnapshot {
                 Ok(NodeInfo {
                     id: row.get(0)?,
                     addr: row.get(1)?,
-                    capacity: row.get(2)?,
-                    used: row.get(3)?,
-                    last_heartbeat: row.get(4)?,
+                    capacity: row.get::<_, i64>(2)? as u64,
+                    used: row.get::<_, i64>(3)? as u64,
+                    last_heartbeat: row.get::<_, i64>(4)? as u64,
                     status,
                 })
             })
@@ -482,30 +482,30 @@ impl MetadataStore {
         node_id: String,
     ) -> bool {
         let mut files = self.files.write().await;
-        if let Some(file_info) = files.get_mut(file_path) {
-            if let Some(block) = file_info.blocks.iter_mut().find(|b| b.block_id == block_id) {
-                let now = now_secs();
-                let replica = ReplicaInfo {
-                    node_id: node_id.clone(),
-                    version: 1,
-                    last_heartbeat: now,
-                };
+        if let Some(file_info) = files.get_mut(file_path)
+            && let Some(block) = file_info.blocks.iter_mut().find(|b| b.block_id == block_id)
+        {
+            let now = now_secs();
+            let replica = ReplicaInfo {
+                node_id: node_id.clone(),
+                version: 1,
+                last_heartbeat: now,
+            };
 
-                if !block.replicas.iter().any(|r| r.node_id == node_id) {
-                    block.replicas.push(replica);
+            if !block.replicas.iter().any(|r| r.node_id == node_id) {
+                block.replicas.push(replica);
 
-                    let db = self.db.lock().unwrap();
-                    db.execute(
-                        "INSERT OR REPLACE INTO replicas (block_id, node_id, version, last_heartbeat) VALUES (?1, ?2, ?3, ?4)",
-                        rusqlite::params![block_id as i64, &node_id, 1i64, now as i64],
-                    ).ok();
-                }
-
-                let mut block_to_nodes = self.block_to_nodes.write().await;
-                block_to_nodes.entry(block_id).or_default().insert(node_id);
-
-                return true;
+                let db = self.db.lock().unwrap();
+                db.execute(
+                    "INSERT OR REPLACE INTO replicas (block_id, node_id, version, last_heartbeat) VALUES (?1, ?2, ?3, ?4)",
+                    rusqlite::params![block_id as i64, &node_id, 1i64, now as i64],
+                ).ok();
             }
+
+            let mut block_to_nodes = self.block_to_nodes.write().await;
+            block_to_nodes.entry(block_id).or_default().insert(node_id);
+
+            return true;
         }
         false
     }

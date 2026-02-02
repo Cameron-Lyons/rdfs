@@ -1,5 +1,5 @@
 use crate::client::connection::{
-    auth_token, Envelope, FileInfo, FileMetadata, Request, Response, StorageNode,
+    Envelope, FileInfo, FileMetadata, Request, Response, StorageNode, auth_token,
 };
 use crate::server::metadata::MetadataStore;
 use crate::server::replication::ReplicationManager;
@@ -182,38 +182,38 @@ async fn handle_client(
     let mut buf = vec![0u8; len];
     socket.read_exact(&mut buf).await?;
 
-    if let Ok(node_msg) = serde_json::from_slice::<serde_json::Value>(&buf) {
-        if let Some(msg_type) = node_msg.get("type").and_then(|v| v.as_str()) {
-            let incoming_token = node_msg
-                .get("token")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
-            if !validate_token(&incoming_token) {
-                eprintln!("Unauthorized node message");
-                return Ok(());
-            }
-            match msg_type {
-                "register_node" => {
-                    if let (Some(node_id), Some(addr), Some(capacity)) = (
-                        node_msg.get("node_id").and_then(|v| v.as_str()),
-                        node_msg.get("addr").and_then(|v| v.as_str()),
-                        node_msg.get("capacity").and_then(|v| v.as_u64()),
-                    ) {
-                        metadata_store
-                            .register_node(node_id.to_string(), addr.to_string(), capacity)
-                            .await;
-                        println!("Registered storage node: {} at {}", node_id, addr);
-                        return Ok(());
-                    }
+    if let Ok(node_msg) = serde_json::from_slice::<serde_json::Value>(&buf)
+        && let Some(msg_type) = node_msg.get("type").and_then(|v| v.as_str())
+    {
+        let incoming_token = node_msg
+            .get("token")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        if !validate_token(&incoming_token) {
+            eprintln!("Unauthorized node message");
+            return Ok(());
+        }
+        match msg_type {
+            "register_node" => {
+                if let (Some(node_id), Some(addr), Some(capacity)) = (
+                    node_msg.get("node_id").and_then(|v| v.as_str()),
+                    node_msg.get("addr").and_then(|v| v.as_str()),
+                    node_msg.get("capacity").and_then(|v| v.as_u64()),
+                ) {
+                    metadata_store
+                        .register_node(node_id.to_string(), addr.to_string(), capacity)
+                        .await;
+                    println!("Registered storage node: {} at {}", node_id, addr);
+                    return Ok(());
                 }
-                "heartbeat" => {
-                    if let Some(node_id) = node_msg.get("node_id").and_then(|v| v.as_str()) {
-                        metadata_store.update_heartbeat(node_id).await;
-                        return Ok(());
-                    }
-                }
-                _ => {}
             }
+            "heartbeat" => {
+                if let Some(node_id) = node_msg.get("node_id").and_then(|v| v.as_str()) {
+                    metadata_store.update_heartbeat(node_id).await;
+                    return Ok(());
+                }
+            }
+            _ => {}
         }
     }
 
