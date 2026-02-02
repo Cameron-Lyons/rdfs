@@ -1,5 +1,8 @@
-use crate::client::connection::{FileInfo, FileMetadata, Request, Response, StorageNode};
+use crate::client::connection::{
+    auth_token, Envelope, FileInfo, FileMetadata, Request, Response, StorageNode,
+};
 use crate::server::metadata::MetadataStore;
+use crate::server::replication::ReplicationManager;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -14,7 +17,7 @@ impl MasterServer {
     pub fn new(addr: String) -> Self {
         Self {
             addr,
-            metadata_store: Arc::new(MetadataStore::new()),
+            metadata_store: Arc::new(MetadataStore::with_path("rdfs_metadata.db")),
             replication_factor: 3,
         }
     }
@@ -24,10 +27,10 @@ impl MasterServer {
         println!("Master server listening on {}", self.addr);
 
         let metadata_store = Arc::clone(&self.metadata_store);
-        let _replication_factor = self.replication_factor;
+        let replication_factor = self.replication_factor;
 
         tokio::spawn(async move {
-            Self::monitor_node_health(metadata_store.clone()).await;
+            Self::monitor_node_health(metadata_store.clone(), replication_factor).await;
         });
 
         let health_addr = self.addr.clone().replace(":9000", ":9080");
@@ -52,7 +55,7 @@ impl MasterServer {
         }
     }
 
-    async fn monitor_node_health(metadata_store: Arc<MetadataStore>) {
+    async fn monitor_node_health(metadata_store: Arc<MetadataStore>, replication_factor: usize) {
         let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(10));
         loop {
             interval.tick().await;
@@ -65,6 +68,15 @@ impl MasterServer {
             for node in nodes {
                 if now - node.last_heartbeat > 60 {
                     println!("Node {} marked as failed", node.id);
+                    let ms = Arc::clone(&metadata_store);
+                    let node_id = node.id.clone();
+                    let rf = replication_factor;
+                    tokio::spawn(async move {
+                        let repl = ReplicationManager::new(ms, rf);
+                        if let Err(e) = repl.handle_node_failure(&node_id).await {
+                            eprintln!("Re-replication error for node {}: {}", node_id, e);
+                        }
+                    });
                 }
             }
         }
@@ -148,6 +160,16 @@ async fn handle_health_check(
     Ok(())
 }
 
+fn validate_token(incoming: &Option<String>) -> bool {
+    match auth_token() {
+        None => true,
+        Some(expected) => match incoming {
+            Some(t) => t == &expected,
+            None => false,
+        },
+    }
+}
+
 async fn handle_client(
     mut socket: TcpStream,
     metadata_store: Arc<MetadataStore>,
@@ -162,6 +184,14 @@ async fn handle_client(
 
     if let Ok(node_msg) = serde_json::from_slice::<serde_json::Value>(&buf) {
         if let Some(msg_type) = node_msg.get("type").and_then(|v| v.as_str()) {
+            let incoming_token = node_msg
+                .get("token")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            if !validate_token(&incoming_token) {
+                eprintln!("Unauthorized node message");
+                return Ok(());
+            }
             match msg_type {
                 "register_node" => {
                     if let (Some(node_id), Some(addr), Some(capacity)) = (
@@ -187,24 +217,37 @@ async fn handle_client(
         }
     }
 
-    let request: Request = serde_json::from_slice(&buf)?;
-    println!("Received request: {:?}", request);
+    if let Ok(envelope) = serde_json::from_slice::<Envelope>(&buf) {
+        if !validate_token(&envelope.token) {
+            let response = Response::Error {
+                message: "Unauthorized".to_string(),
+            };
+            let response_bytes = serde_json::to_vec(&response)?;
+            let len = (response_bytes.len() as u32).to_be_bytes();
+            socket.write_all(&len).await?;
+            socket.write_all(&response_bytes).await?;
+            return Ok(());
+        }
 
-    let response = match request {
-        Request::Lookup { path } => handle_lookup(&metadata_store, &path).await,
-        Request::Create { path } => handle_create(&metadata_store, &path).await,
-        Request::List { path } => handle_list(&metadata_store, &path).await,
-        Request::Rename { from, to } => handle_rename(&metadata_store, &from, &to).await,
-        Request::Delete { path } => handle_delete(&metadata_store, &path).await,
-        _ => Response::Error {
-            message: "Unsupported operation on master".to_string(),
-        },
-    };
+        let request = envelope.payload;
+        println!("Received request: {:?}", request);
 
-    let response_bytes = serde_json::to_vec(&response)?;
-    let len = (response_bytes.len() as u32).to_be_bytes();
-    socket.write_all(&len).await?;
-    socket.write_all(&response_bytes).await?;
+        let response = match request {
+            Request::Lookup { path } => handle_lookup(&metadata_store, &path).await,
+            Request::Create { path } => handle_create(&metadata_store, &path).await,
+            Request::List { path } => handle_list(&metadata_store, &path).await,
+            Request::Rename { from, to } => handle_rename(&metadata_store, &from, &to).await,
+            Request::Delete { path } => handle_delete(&metadata_store, &path).await,
+            _ => Response::Error {
+                message: "Unsupported operation on master".to_string(),
+            },
+        };
+
+        let response_bytes = serde_json::to_vec(&response)?;
+        let len = (response_bytes.len() as u32).to_be_bytes();
+        socket.write_all(&len).await?;
+        socket.write_all(&response_bytes).await?;
+    }
 
     Ok(())
 }

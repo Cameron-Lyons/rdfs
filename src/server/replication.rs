@@ -1,4 +1,4 @@
-use crate::client::connection::{Request, Response};
+use crate::client::connection::{auth_token, Envelope, Request, Response};
 use crate::server::metadata::{MetadataStore, NodeInfo};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -111,8 +111,16 @@ impl ReplicationManager {
                 }
 
                 if let Some(source_replica) = block.replicas.first() {
-                    if let Ok(data) = read_from_node(&source_replica.node_id, block.block_id).await
-                    {
+                    let source_addr = self
+                        .metadata_store
+                        .get_node(&source_replica.node_id)
+                        .await
+                        .map(|n| n.addr.clone())
+                        .ok_or_else(|| {
+                            format!("Source node {} not found", source_replica.node_id)
+                        })?;
+
+                    if let Ok(data) = read_from_node(&source_addr, block.block_id).await {
                         for node in new_nodes {
                             if write_to_node(&node, block.block_id, &data).await.is_ok() {
                                 self.metadata_store
@@ -131,7 +139,15 @@ impl ReplicationManager {
     pub async fn handle_node_failure(&self, failed_node_id: &str) -> Result<(), String> {
         println!("Handling failure of node: {}", failed_node_id);
 
-        let _files = self.metadata_store.get_file("").await;
+        self.metadata_store.mark_node_failed(failed_node_id).await;
+
+        let file_paths = self.metadata_store.get_all_file_paths().await;
+
+        for path in file_paths {
+            if let Err(e) = self.ensure_replication(&path).await {
+                eprintln!("Re-replication failed for {}: {}", path, e);
+            }
+        }
 
         Ok(())
     }
@@ -147,7 +163,12 @@ async fn write_to_node(node: &NodeInfo, block_id: u64, data: &[u8]) -> Result<()
         data: data.to_vec(),
     };
 
-    let msg = serde_json::to_vec(&request).map_err(|e| e.to_string())?;
+    let envelope = Envelope {
+        token: auth_token(),
+        payload: request,
+    };
+
+    let msg = serde_json::to_vec(&envelope).map_err(|e| e.to_string())?;
     let len = (msg.len() as u32).to_be_bytes();
 
     stream.write_all(&len).await.map_err(|e| e.to_string())?;
@@ -181,7 +202,11 @@ async fn read_from_node(node_addr: &str, block_id: u64) -> Result<Vec<u8>, Strin
         .map_err(|e| format!("Failed to connect: {}", e))?;
 
     let request = Request::ReadBlock { block_id };
-    let msg = serde_json::to_vec(&request).map_err(|e| e.to_string())?;
+    let envelope = Envelope {
+        token: auth_token(),
+        payload: request,
+    };
+    let msg = serde_json::to_vec(&envelope).map_err(|e| e.to_string())?;
     let len = (msg.len() as u32).to_be_bytes();
 
     stream.write_all(&len).await.map_err(|e| e.to_string())?;

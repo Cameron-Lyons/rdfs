@@ -1,4 +1,4 @@
-use crate::client::connection::{Request, Response};
+use crate::client::connection::{auth_token, Envelope, Request, Response};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -76,7 +76,8 @@ impl StorageNode {
             "type": "register_node",
             "node_id": self.id,
             "addr": self.addr,
-            "capacity": self.capacity
+            "capacity": self.capacity,
+            "token": auth_token()
         });
 
         let msg = serde_json::to_vec(&registration)?;
@@ -99,7 +100,8 @@ impl StorageNode {
                 if let Ok(mut stream) = TcpStream::connect(&master_addr).await {
                     let heartbeat = serde_json::json!({
                         "type": "heartbeat",
-                        "node_id": node_id.clone()
+                        "node_id": node_id.clone(),
+                        "token": auth_token()
                     });
 
                     if let Ok(msg) = serde_json::to_vec(&heartbeat) {
@@ -119,6 +121,8 @@ async fn handle_storage_request(
     data_dir: PathBuf,
     used: Arc<RwLock<u64>>,
 ) -> tokio::io::Result<()> {
+    let expected_token = auth_token();
+
     loop {
         let mut len_buf = [0u8; 4];
         match socket.read_exact(&mut len_buf).await {
@@ -133,16 +137,49 @@ async fn handle_storage_request(
         let mut buf = vec![0u8; len];
         socket.read_exact(&mut buf).await?;
 
-        let request: Request = serde_json::from_slice(&buf)?;
+        let (request, early_response) =
+            if let Ok(envelope) = serde_json::from_slice::<Envelope>(&buf) {
+                if let Some(ref expected) = expected_token {
+                    match &envelope.token {
+                        Some(t) if t == expected => (Some(envelope.payload), None),
+                        _ => (
+                            None,
+                            Some(Response::Error {
+                                message: "Unauthorized".to_string(),
+                            }),
+                        ),
+                    }
+                } else {
+                    (Some(envelope.payload), None)
+                }
+            } else {
+                match serde_json::from_slice::<Request>(&buf) {
+                    Ok(req) => (Some(req), None),
+                    Err(e) => (
+                        None,
+                        Some(Response::Error {
+                            message: format!("Invalid request: {e}"),
+                        }),
+                    ),
+                }
+            };
 
-        let response = match request {
-            Request::ReadBlock { block_id } => handle_read_block(&blocks, block_id).await,
-            Request::WriteBlock { block_id, data } => {
-                handle_write_block(&blocks, &data_dir, &used, block_id, data).await
+        let response = if let Some(r) = early_response {
+            r
+        } else if let Some(request) = request {
+            match request {
+                Request::ReadBlock { block_id } => handle_read_block(&blocks, block_id).await,
+                Request::WriteBlock { block_id, data } => {
+                    handle_write_block(&blocks, &data_dir, &used, block_id, data).await
+                }
+                _ => Response::Error {
+                    message: "Invalid request for storage node".to_string(),
+                },
             }
-            _ => Response::Error {
-                message: "Invalid request for storage node".to_string(),
-            },
+        } else {
+            Response::Error {
+                message: "Invalid request".to_string(),
+            }
         };
 
         let response_bytes = serde_json::to_vec(&response)?;

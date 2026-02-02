@@ -11,6 +11,9 @@ pub enum DfsError {
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 
+    #[error("unauthorized: {0}")]
+    Unauthorized(String),
+
     #[error("unknown error")]
     Unknown,
 }

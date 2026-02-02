@@ -1,8 +1,12 @@
 use crate::client::error::DfsError;
+use flate2::read::GzDecoder;
+use flate2::write::GzEncoder;
+use flate2::Compression;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::io::{Read as IoRead, Write as IoWrite};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -439,7 +443,8 @@ impl ConnectionManager {
                 })
                 .await
             {
-                Ok(data) => {
+                Ok(raw) => {
+                    let data = decompress(&raw)?;
                     self.block_cache.put(block_id, data.clone()).await;
 
                     let mut stats = self.connection_stats.write().await;
@@ -479,10 +484,12 @@ impl ConnectionManager {
         let required_writes = metadata.nodes.len().div_ceil(2);
         let mut errors = Vec::new();
 
+        let compressed = compress(data);
+
         let mut write_tasks = Vec::new();
         for node in &metadata.nodes {
             let node_addr = node.addr.clone();
-            let data = data.to_vec();
+            let data = compressed.clone();
             let pool = self.connection_pool.clone();
 
             let task = tokio::spawn(async move {
@@ -526,7 +533,7 @@ impl ConnectionManager {
 
         let mut stats = self.connection_stats.write().await;
         stats.total_requests += metadata.nodes.len() as u64;
-        stats.bytes_sent += (data.len() * metadata.nodes.len()) as u64;
+        stats.bytes_sent += (compressed.len() * metadata.nodes.len()) as u64;
 
         if successful_writes >= required_writes {
             Ok(())
@@ -663,7 +670,7 @@ pub struct ConnectionStatsSnapshot {
     pub last_error: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Request {
     Lookup {
         path: String,
@@ -726,8 +733,37 @@ pub struct StorageNode {
     pub addr: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Envelope {
+    pub token: Option<String>,
+    pub payload: Request,
+}
+
+pub fn auth_token() -> Option<String> {
+    std::env::var("RDFS_AUTH_TOKEN").ok()
+}
+
+pub fn compress(data: &[u8]) -> Vec<u8> {
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
+    encoder.write_all(data).expect("compression write failed");
+    encoder.finish().expect("compression finish failed")
+}
+
+pub fn decompress(data: &[u8]) -> Result<Vec<u8>, DfsError> {
+    let mut decoder = GzDecoder::new(data);
+    let mut buf = Vec::new();
+    decoder
+        .read_to_end(&mut buf)
+        .map_err(|e| DfsError::Network(format!("decompression failed: {e}")))?;
+    Ok(buf)
+}
+
 async fn send_request(stream: &mut TcpStream, req: &Request) -> Result<(), DfsError> {
-    let msg = serde_json::to_vec(req).map_err(|e| DfsError::Network(e.to_string()))?;
+    let envelope = Envelope {
+        token: auth_token(),
+        payload: req.clone(),
+    };
+    let msg = serde_json::to_vec(&envelope).map_err(|e| DfsError::Network(e.to_string()))?;
     let len = (msg.len() as u32).to_be_bytes();
 
     stream.write_all(&len).await?;

@@ -50,17 +50,16 @@ async fn setup_test_environment() -> (
 async fn test_integration_basic() {
     let (master_handle, storage_handles) = setup_test_environment().await;
 
-    let client = DfsClient::new("127.0.0.1:9010").await;
-
-    if client.is_err() {
-        master_handle.abort();
-        for handle in storage_handles {
-            handle.abort();
+    let client = match DfsClient::new("127.0.0.1:9010").await {
+        Ok(c) => c,
+        Err(_) => {
+            master_handle.abort();
+            for handle in storage_handles {
+                handle.abort();
+            }
+            return;
         }
-        return;
-    }
-
-    let client = client.unwrap();
+    };
 
     let stats = client.get_connection_stats().await;
     assert_eq!(stats.total_requests, 0);
@@ -75,29 +74,23 @@ async fn test_integration_basic() {
 async fn test_integration_advanced() {
     let (master_handle, storage_handles) = setup_test_environment().await;
 
-    let client = DfsClient::new("127.0.0.1:9010").await;
-
-    if client.is_err() {
-        master_handle.abort();
-        for handle in storage_handles {
-            handle.abort();
+    let client = match DfsClient::new("127.0.0.1:9010").await {
+        Ok(c) => c,
+        Err(_) => {
+            master_handle.abort();
+            for handle in storage_handles {
+                handle.abort();
+            }
+            return;
         }
-        return;
-    }
+    };
 
-    let client = client.unwrap();
-
-    let result = client.create("/test/advanced.txt").await;
-    if result.is_ok() {
-        let file = result.unwrap();
+    if let Ok(file) = client.create("/test/advanced.txt").await {
         assert_eq!(file.get_path(), "/test/advanced.txt");
         assert_eq!(file.get_size(), 0);
     }
 
-    let result = client.list("/test").await;
-    if result.is_ok() {
-        let _files = result.unwrap();
-    }
+    if let Ok(_files) = client.list("/test").await {}
 
     master_handle.abort();
     for handle in storage_handles {
@@ -109,42 +102,31 @@ async fn test_integration_advanced() {
 async fn test_end_to_end() {
     let (master_handle, storage_handles) = setup_test_environment().await;
 
-    let client = DfsClient::new("127.0.0.1:9010").await;
-
-    if client.is_err() {
-        master_handle.abort();
-        for handle in storage_handles {
-            handle.abort();
+    let client = match DfsClient::new("127.0.0.1:9010").await {
+        Ok(c) => c,
+        Err(_) => {
+            master_handle.abort();
+            for handle in storage_handles {
+                handle.abort();
+            }
+            return;
         }
-        return;
-    }
+    };
 
-    let client = client.unwrap();
-
-    let create_result = client.create("/test/e2e.txt").await;
-    if create_result.is_ok() {
-        let _file = create_result.unwrap();
-
-        let open_result = client.open("/test/e2e.txt").await;
-        if open_result.is_ok() {
-            let opened_file = open_result.unwrap();
+    if let Ok(_file) = client.create("/test/e2e.txt").await {
+        if let Ok(opened_file) = client.open("/test/e2e.txt").await {
             assert_eq!(opened_file.get_path(), "/test/e2e.txt");
         }
 
-        let rename_result = client
+        if client
             .rename("/test/e2e.txt", "/test/e2e_renamed.txt")
-            .await;
-        if rename_result.is_ok() {
-            let renamed_open = client.open("/test/e2e_renamed.txt").await;
-            if renamed_open.is_ok() {
-                let delete_result = client.delete("/test/e2e_renamed.txt").await;
-                assert!(delete_result.is_ok() || delete_result.is_err());
-            }
+            .await
+            .is_ok()
+            && client.open("/test/e2e_renamed.txt").await.is_ok()
+        {
+            let _ = client.delete("/test/e2e_renamed.txt").await;
         }
     }
-
-    let stats = client.get_connection_stats().await;
-    assert!(stats.total_requests == stats.total_requests);
 
     master_handle.abort();
     for handle in storage_handles {
