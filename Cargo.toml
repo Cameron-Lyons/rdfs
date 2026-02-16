@@ -1,7 +1,7 @@
 [package]
 name = "rdfs"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 
 [dependencies]
 tokio = { version = "1.49.0", features = ["full"] }
@@ -9,8 +9,8 @@ thiserror = "2.0.18"
 async-trait = "0.1.89"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
-flate2 = "1.1.8"
-rusqlite = { version = "0.32", features = ["bundled"] }
+flate2 = "1.1.9"
+rusqlite = { version = "0.38.0", features = ["bundled"] }
 
 [[bin]]
 name = "master"

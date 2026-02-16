@@ -50,6 +50,7 @@ pub struct MetadataStore {
     files: Arc<RwLock<HashMap<String, FileInfo>>>,
     nodes: Arc<RwLock<HashMap<String, NodeInfo>>>,
     block_to_nodes: Arc<RwLock<HashMap<u64, HashSet<String>>>>,
+    under_replicated_blocks: Arc<RwLock<HashSet<u64>>>,
     next_block_id: Arc<RwLock<u64>>,
     db: Arc<std::sync::Mutex<rusqlite::Connection>>,
 }
@@ -244,6 +245,7 @@ impl MetadataStore {
             files: Arc::new(RwLock::new(HashMap::new())),
             nodes: Arc::new(RwLock::new(HashMap::new())),
             block_to_nodes: Arc::new(RwLock::new(HashMap::new())),
+            under_replicated_blocks: Arc::new(RwLock::new(HashSet::new())),
             next_block_id: Arc::new(RwLock::new(1)),
             db: Arc::new(std::sync::Mutex::new(conn)),
         }
@@ -258,6 +260,7 @@ impl MetadataStore {
             files: Arc::new(RwLock::new(files)),
             nodes: Arc::new(RwLock::new(nodes)),
             block_to_nodes: Arc::new(RwLock::new(block_to_nodes)),
+            under_replicated_blocks: Arc::new(RwLock::new(HashSet::new())),
             next_block_id: Arc::new(RwLock::new(next_block_id)),
             db: Arc::new(std::sync::Mutex::new(conn)),
         }
@@ -313,9 +316,11 @@ impl MetadataStore {
         let mut files = self.files.write().await;
         if let Some(file_info) = files.remove(path) {
             let mut block_to_nodes = self.block_to_nodes.write().await;
+            let mut under_replicated = self.under_replicated_blocks.write().await;
             let db = self.db.lock().unwrap();
             for block in &file_info.blocks {
                 block_to_nodes.remove(&block.block_id);
+                under_replicated.remove(&block.block_id);
                 db.execute(
                     "DELETE FROM replicas WHERE block_id = ?1",
                     rusqlite::params![block.block_id as i64],
@@ -335,9 +340,13 @@ impl MetadataStore {
         }
     }
 
-    pub async fn list_files(&self, _path: &str) -> Vec<FileInfo> {
+    pub async fn list_files(&self, path: &str) -> Vec<FileInfo> {
         let files = self.files.read().await;
-        files.values().cloned().collect()
+        files
+            .values()
+            .filter(|f| path == "/" || f.path.starts_with(path))
+            .cloned()
+            .collect()
     }
 
     pub async fn rename_file(&self, from: &str, to: &str) -> bool {
@@ -415,18 +424,21 @@ impl MetadataStore {
         ).ok();
     }
 
-    pub async fn update_heartbeat(&self, node_id: &str) {
+    pub async fn update_heartbeat(&self, node_id: &str, used: Option<u64>) {
         let now = now_secs();
         let mut nodes = self.nodes.write().await;
         if let Some(node) = nodes.get_mut(node_id) {
             node.last_heartbeat = now;
             node.status = NodeStatus::Active;
+            if let Some(used) = used {
+                node.used = used.min(node.capacity);
+            }
         }
 
         let db = self.db.lock().unwrap();
         db.execute(
-            "UPDATE nodes SET last_heartbeat = ?1, status = ?2 WHERE id = ?3",
-            rusqlite::params![now as i64, "Active", node_id],
+            "UPDATE nodes SET last_heartbeat = ?1, status = ?2, used = COALESCE(?3, used) WHERE id = ?4",
+            rusqlite::params![now as i64, "Active", used.map(|v| v as i64), node_id],
         )
         .ok();
     }
@@ -463,6 +475,29 @@ impl MetadataStore {
             rusqlite::params![status_str(&NodeStatus::Failed), node_id],
         )
         .ok();
+    }
+
+    pub async fn remove_node_replicas(&self, node_id: &str) {
+        let mut files = self.files.write().await;
+        let mut block_to_nodes = self.block_to_nodes.write().await;
+        let db = self.db.lock().unwrap();
+
+        for file in files.values_mut() {
+            for block in &mut file.blocks {
+                block.replicas.retain(|r| r.node_id != node_id);
+                if let Some(nodes) = block_to_nodes.get_mut(&block.block_id) {
+                    nodes.remove(node_id);
+                    if nodes.is_empty() {
+                        block_to_nodes.remove(&block.block_id);
+                    }
+                }
+                db.execute(
+                    "DELETE FROM replicas WHERE block_id = ?1 AND node_id = ?2",
+                    rusqlite::params![block.block_id as i64, node_id],
+                )
+                .ok();
+            }
+        }
     }
 
     pub async fn get_node(&self, node_id: &str) -> Option<NodeInfo> {
@@ -508,5 +543,120 @@ impl MetadataStore {
             return true;
         }
         false
+    }
+
+    pub async fn add_replica_by_block_id(&self, block_id: u64, node_id: String) -> bool {
+        let mut files = self.files.write().await;
+        for file_info in files.values_mut() {
+            if let Some(block) = file_info.blocks.iter_mut().find(|b| b.block_id == block_id) {
+                let now = now_secs();
+                if !block.replicas.iter().any(|r| r.node_id == node_id) {
+                    block.replicas.push(ReplicaInfo {
+                        node_id: node_id.clone(),
+                        version: 1,
+                        last_heartbeat: now,
+                    });
+                    let db = self.db.lock().unwrap();
+                    db.execute(
+                        "INSERT OR REPLACE INTO replicas (block_id, node_id, version, last_heartbeat) VALUES (?1, ?2, ?3, ?4)",
+                        rusqlite::params![block_id as i64, &node_id, 1i64, now as i64],
+                    ).ok();
+                }
+                let mut block_to_nodes = self.block_to_nodes.write().await;
+                block_to_nodes.entry(block_id).or_default().insert(node_id);
+                return true;
+            }
+        }
+        false
+    }
+
+    pub async fn commit_block(
+        &self,
+        file_path: &str,
+        block_id: u64,
+        size: u64,
+        checksum: String,
+        replica_nodes: &[String],
+    ) -> bool {
+        let now = now_secs();
+        let mut files = self.files.write().await;
+        let Some(file_info) = files.get_mut(file_path) else {
+            return false;
+        };
+
+        let Some(block) = file_info.blocks.iter_mut().find(|b| b.block_id == block_id) else {
+            return false;
+        };
+
+        block.size = size;
+        block.checksum = checksum.clone();
+        block.replicas = replica_nodes
+            .iter()
+            .cloned()
+            .map(|node_id| ReplicaInfo {
+                node_id,
+                version: 1,
+                last_heartbeat: now,
+            })
+            .collect();
+
+        file_info.size = file_info.blocks.iter().map(|b| b.size).sum();
+        file_info.modified_at = now;
+
+        let mut block_to_nodes = self.block_to_nodes.write().await;
+        block_to_nodes.insert(block_id, replica_nodes.iter().cloned().collect());
+
+        let db = self.db.lock().unwrap();
+        db.execute(
+            "UPDATE blocks SET size = ?1, checksum = ?2 WHERE block_id = ?3",
+            rusqlite::params![size as i64, checksum, block_id as i64],
+        )
+        .ok();
+        db.execute(
+            "UPDATE files SET size = ?1, modified_at = ?2 WHERE path = ?3",
+            rusqlite::params![file_info.size as i64, now as i64, file_path],
+        )
+        .ok();
+        db.execute(
+            "DELETE FROM replicas WHERE block_id = ?1",
+            rusqlite::params![block_id as i64],
+        )
+        .ok();
+        for node_id in replica_nodes {
+            db.execute(
+                "INSERT OR REPLACE INTO replicas (block_id, node_id, version, last_heartbeat) VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![block_id as i64, node_id, 1i64, now as i64],
+            )
+            .ok();
+        }
+        true
+    }
+
+    pub async fn mark_block_under_replicated(&self, block_id: u64) {
+        let mut blocks = self.under_replicated_blocks.write().await;
+        blocks.insert(block_id);
+    }
+
+    pub async fn clear_block_under_replicated(&self, block_id: u64) {
+        let mut blocks = self.under_replicated_blocks.write().await;
+        blocks.remove(&block_id);
+    }
+
+    pub async fn under_replicated_count(&self) -> usize {
+        self.under_replicated_blocks.read().await.len()
+    }
+
+    pub async fn get_under_replicated_file_paths(&self) -> Vec<String> {
+        let blocks = self.under_replicated_blocks.read().await.clone();
+        let files = self.files.read().await;
+        let mut paths = HashSet::new();
+
+        for (path, info) in files.iter() {
+            if info.blocks.iter().any(|b| blocks.contains(&b.block_id)) {
+                paths.insert(path.clone());
+            }
+        }
+
+        paths.into_iter().collect()
     }
 }

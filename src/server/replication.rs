@@ -1,4 +1,4 @@
-use crate::client::connection::{auth_token, Envelope, Request, Response};
+use crate::client::connection::{Envelope, Request, Response, auth_token};
 use crate::server::metadata::{MetadataStore, NodeInfo};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -107,6 +107,9 @@ impl ReplicationManager {
                         "Warning: Cannot achieve replication factor {} for block {}",
                         self.replication_factor, block.block_id
                     );
+                    self.metadata_store
+                        .mark_block_under_replicated(block.block_id)
+                        .await;
                     continue;
                 }
 
@@ -121,15 +124,38 @@ impl ReplicationManager {
                         })?;
 
                     if let Ok(data) = read_from_node(&source_addr, block.block_id).await {
+                        let mut added = 0usize;
                         for node in new_nodes {
                             if write_to_node(&node, block.block_id, &data).await.is_ok() {
                                 self.metadata_store
                                     .update_block_replicas(file_path, block.block_id, node.id)
                                     .await;
+                                added += 1;
                             }
                         }
+                        if replica_count + added >= self.replication_factor {
+                            self.metadata_store
+                                .clear_block_under_replicated(block.block_id)
+                                .await;
+                        } else {
+                            self.metadata_store
+                                .mark_block_under_replicated(block.block_id)
+                                .await;
+                        }
+                    } else {
+                        self.metadata_store
+                            .mark_block_under_replicated(block.block_id)
+                            .await;
                     }
+                } else {
+                    self.metadata_store
+                        .mark_block_under_replicated(block.block_id)
+                        .await;
                 }
+            } else {
+                self.metadata_store
+                    .clear_block_under_replicated(block.block_id)
+                    .await;
             }
         }
 
@@ -140,6 +166,9 @@ impl ReplicationManager {
         println!("Handling failure of node: {}", failed_node_id);
 
         self.metadata_store.mark_node_failed(failed_node_id).await;
+        self.metadata_store
+            .remove_node_replicas(failed_node_id)
+            .await;
 
         let file_paths = self.metadata_store.get_all_file_paths().await;
 

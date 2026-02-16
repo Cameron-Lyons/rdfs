@@ -483,11 +483,14 @@ impl ConnectionManager {
         let mut successful_writes = 0;
         let required_writes = metadata.nodes.len().div_ceil(2);
         let mut errors = Vec::new();
+        let mut successful_replicas = Vec::new();
 
         let compressed = compress(data);
+        let checksum = checksum_hex(&compressed);
 
         let mut write_tasks = Vec::new();
         for node in &metadata.nodes {
+            let node_id = node.id.clone();
             let node_addr = node.addr.clone();
             let data = compressed.clone();
             let pool = self.connection_pool.clone();
@@ -507,7 +510,7 @@ impl ConnectionManager {
                         match recv_response(&mut stream).await {
                             Ok(Response::Ok) => {
                                 pool.return_connection(&node_addr, stream).await;
-                                Ok(node_addr)
+                                Ok(node_id)
                             }
                             Ok(Response::Error { message }) => {
                                 Err((node_addr, DfsError::Network(message)))
@@ -525,7 +528,10 @@ impl ConnectionManager {
 
         for task in write_tasks {
             match task.await {
-                Ok(Ok(_)) => successful_writes += 1,
+                Ok(Ok(node_id)) => {
+                    successful_writes += 1;
+                    successful_replicas.push(node_id);
+                }
                 Ok(Err((addr, e))) => errors.push(format!("{}: {}", addr, e)),
                 Err(e) => errors.push(format!("Task error: {}", e)),
             }
@@ -536,7 +542,14 @@ impl ConnectionManager {
         stats.bytes_sent += (compressed.len() * metadata.nodes.len()) as u64;
 
         if successful_writes >= required_writes {
-            Ok(())
+            self.commit_block(
+                &metadata.path,
+                block_id,
+                data.len() as u64,
+                checksum,
+                successful_replicas,
+            )
+            .await
         } else {
             stats.failed_requests += (metadata.nodes.len() - successful_writes) as u64;
             stats.last_error = Some(format!(
@@ -549,6 +562,38 @@ impl ConnectionManager {
                 required_writes, successful_writes
             )))
         }
+    }
+
+    async fn commit_block(
+        &self,
+        path: &str,
+        block_id: u64,
+        size: u64,
+        checksum: String,
+        replicas: Vec<String>,
+    ) -> Result<(), DfsError> {
+        self.execute_with_retry(&self.master_addr, |mut stream| {
+            let path = path.to_string();
+            let checksum = checksum.clone();
+            let replicas = replicas.clone();
+            Box::pin(async move {
+                let request = Request::CommitBlock {
+                    path,
+                    block_id,
+                    size,
+                    checksum,
+                    replicas,
+                };
+                send_request(&mut stream, &request).await?;
+                let response: Response = recv_response(&mut stream).await?;
+                match response {
+                    Response::Ok => Ok((stream, ())),
+                    Response::Error { message } => Err(DfsError::Network(message)),
+                    _ => Err(DfsError::Unknown),
+                }
+            })
+        })
+        .await
     }
 
     pub async fn create_file(&self, path: &str) -> Result<FileMetadata, DfsError> {
@@ -692,6 +737,13 @@ pub enum Request {
         block_id: u64,
         data: Vec<u8>,
     },
+    CommitBlock {
+        path: String,
+        block_id: u64,
+        size: u64,
+        checksum: String,
+        replicas: Vec<String>,
+    },
     Delete {
         path: String,
     },
@@ -756,6 +808,15 @@ pub fn decompress(data: &[u8]) -> Result<Vec<u8>, DfsError> {
         .read_to_end(&mut buf)
         .map_err(|e| DfsError::Network(format!("decompression failed: {e}")))?;
     Ok(buf)
+}
+
+fn checksum_hex(data: &[u8]) -> String {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for byte in data {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{:016x}", hash)
 }
 
 async fn send_request(stream: &mut TcpStream, req: &Request) -> Result<(), DfsError> {

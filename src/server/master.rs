@@ -15,9 +15,10 @@ pub struct MasterServer {
 
 impl MasterServer {
     pub fn new(addr: String) -> Self {
+        let db_path = format!("rdfs_metadata_{}.db", addr.replace([':', '.'], "_"));
         Self {
             addr,
-            metadata_store: Arc::new(MetadataStore::with_path("rdfs_metadata.db")),
+            metadata_store: Arc::new(MetadataStore::with_path(&db_path)),
             replication_factor: 3,
         }
     }
@@ -33,7 +34,7 @@ impl MasterServer {
             Self::monitor_node_health(metadata_store.clone(), replication_factor).await;
         });
 
-        let health_addr = self.addr.clone().replace(":9000", ":9080");
+        let health_addr = health_addr_for(&self.addr);
         let health_metadata_store = Arc::clone(&self.metadata_store);
         tokio::spawn(async move {
             if let Err(e) = Self::start_health_endpoint(&health_addr, health_metadata_store).await {
@@ -79,6 +80,19 @@ impl MasterServer {
                     });
                 }
             }
+
+            let under_replicated_paths = metadata_store.get_under_replicated_file_paths().await;
+            if !under_replicated_paths.is_empty() {
+                let ms = Arc::clone(&metadata_store);
+                tokio::spawn(async move {
+                    let repl = ReplicationManager::new(ms, replication_factor);
+                    for path in under_replicated_paths {
+                        if let Err(e) = repl.ensure_replication(&path).await {
+                            eprintln!("Under-replication retry failed for {}: {}", path, e);
+                        }
+                    }
+                });
+            }
         }
     }
 
@@ -107,6 +121,15 @@ impl MasterServer {
     }
 }
 
+fn health_addr_for(master_addr: &str) -> String {
+    if let Some((host, port_str)) = master_addr.rsplit_once(':')
+        && let Ok(port) = port_str.parse::<u16>()
+    {
+        return format!("{}:{}", host, port.saturating_add(80));
+    }
+    format!("{}:9080", master_addr)
+}
+
 async fn handle_health_check(
     socket: &mut TcpStream,
     metadata_store: Arc<MetadataStore>,
@@ -130,7 +153,8 @@ async fn handle_health_check(
                 "metrics": {
                     "active_storage_nodes": nodes.len(),
                     "total_files": files.len(),
-                    "replication_factor": 3
+                    "replication_factor": 3,
+                    "under_replicated_blocks": metadata_store.under_replicated_count().await
                 },
                 "storage_nodes": nodes.iter().map(|n| {
                     serde_json::json!({
@@ -173,7 +197,7 @@ fn validate_token(incoming: &Option<String>) -> bool {
 async fn handle_client(
     mut socket: TcpStream,
     metadata_store: Arc<MetadataStore>,
-    _replication_factor: usize,
+    replication_factor: usize,
 ) -> tokio::io::Result<()> {
     let mut len_buf = [0u8; 4];
     socket.read_exact(&mut len_buf).await?;
@@ -209,7 +233,23 @@ async fn handle_client(
             }
             "heartbeat" => {
                 if let Some(node_id) = node_msg.get("node_id").and_then(|v| v.as_str()) {
-                    metadata_store.update_heartbeat(node_id).await;
+                    let used = node_msg.get("used").and_then(|v| v.as_u64());
+                    metadata_store.update_heartbeat(node_id, used).await;
+                    return Ok(());
+                }
+            }
+            "block_inventory" => {
+                if let (Some(node_id), Some(blocks)) = (
+                    node_msg.get("node_id").and_then(|v| v.as_str()),
+                    node_msg.get("blocks").and_then(|v| v.as_array()),
+                ) {
+                    for block in blocks {
+                        if let Some(block_id) = block.as_u64() {
+                            metadata_store
+                                .add_replica_by_block_id(block_id, node_id.to_string())
+                                .await;
+                        }
+                    }
                     return Ok(());
                 }
             }
@@ -234,10 +274,26 @@ async fn handle_client(
 
         let response = match request {
             Request::Lookup { path } => handle_lookup(&metadata_store, &path).await,
-            Request::Create { path } => handle_create(&metadata_store, &path).await,
+            Request::Create { path } => {
+                handle_create(&metadata_store, &path, replication_factor).await
+            }
+            Request::CreateWithReplication {
+                path,
+                replication_factor,
+            } => handle_create(&metadata_store, &path, replication_factor).await,
             Request::List { path } => handle_list(&metadata_store, &path).await,
             Request::Rename { from, to } => handle_rename(&metadata_store, &from, &to).await,
             Request::Delete { path } => handle_delete(&metadata_store, &path).await,
+            Request::CommitBlock {
+                path,
+                block_id,
+                size,
+                checksum,
+                replicas,
+            } => {
+                handle_commit_block(&metadata_store, &path, block_id, size, checksum, replicas)
+                    .await
+            }
             _ => Response::Error {
                 message: "Unsupported operation on master".to_string(),
             },
@@ -254,11 +310,11 @@ async fn handle_client(
 
 async fn handle_lookup(metadata_store: &Arc<MetadataStore>, path: &str) -> Response {
     if let Some(file_info) = metadata_store.get_file(path).await {
-        let active_nodes = metadata_store.get_active_nodes().await;
-
-        let storage_nodes: Vec<StorageNode> = active_nodes
+        let selected = metadata_store
+            .select_nodes_for_replication(file_info.replication_factor.max(1))
+            .await;
+        let storage_nodes: Vec<StorageNode> = selected
             .iter()
-            .take(3)
             .map(|node| StorageNode {
                 id: node.id.clone(),
                 addr: node.addr.clone(),
@@ -274,51 +330,23 @@ async fn handle_lookup(metadata_store: &Arc<MetadataStore>, path: &str) -> Respo
 
         Response::Metadata { metadata }
     } else {
-        let file_info = metadata_store.create_file(path.to_string(), 3).await;
-
-        let active_nodes = metadata_store.get_active_nodes().await;
-        let storage_nodes: Vec<StorageNode> = active_nodes
-            .iter()
-            .take(3)
-            .map(|node| StorageNode {
-                id: node.id.clone(),
-                addr: node.addr.clone(),
-            })
-            .collect();
-
-        if storage_nodes.is_empty() {
-            metadata_store.delete_file(path).await;
-            return Response::Error {
-                message: "No storage nodes available".to_string(),
-            };
+        Response::Error {
+            message: format!("File not found: {}", path),
         }
-
-        let block_id = metadata_store.allocate_block(path).await.unwrap_or(1);
-
-        for node in &storage_nodes {
-            metadata_store
-                .update_block_replicas(path, block_id, node.id.clone())
-                .await;
-        }
-
-        let metadata = FileMetadata {
-            path: file_info.path,
-            size: file_info.size,
-            blocks: vec![block_id],
-            nodes: storage_nodes,
-        };
-
-        Response::Metadata { metadata }
     }
 }
 
-async fn handle_create(metadata_store: &Arc<MetadataStore>, path: &str) -> Response {
-    let file_info = metadata_store.create_file(path.to_string(), 3).await;
+async fn handle_create(
+    metadata_store: &Arc<MetadataStore>,
+    path: &str,
+    replication_factor: usize,
+) -> Response {
+    let rf = replication_factor.max(1);
+    let file_info = metadata_store.create_file(path.to_string(), rf).await;
 
-    let active_nodes = metadata_store.get_active_nodes().await;
-    let storage_nodes: Vec<StorageNode> = active_nodes
+    let selected = metadata_store.select_nodes_for_replication(rf).await;
+    let storage_nodes: Vec<StorageNode> = selected
         .iter()
-        .take(3)
         .map(|node| StorageNode {
             id: node.id.clone(),
             addr: node.addr.clone(),
@@ -332,12 +360,19 @@ async fn handle_create(metadata_store: &Arc<MetadataStore>, path: &str) -> Respo
         };
     }
 
-    let block_id = metadata_store.allocate_block(path).await.unwrap_or(1);
+    let Some(block_id) = metadata_store.allocate_block(path).await else {
+        return Response::Error {
+            message: format!("Failed to allocate block for {}", path),
+        };
+    };
 
     for node in &storage_nodes {
         metadata_store
             .update_block_replicas(path, block_id, node.id.clone())
             .await;
+    }
+    if storage_nodes.len() < rf {
+        metadata_store.mark_block_under_replicated(block_id).await;
     }
 
     let metadata = FileMetadata {
@@ -382,6 +417,26 @@ async fn handle_delete(metadata_store: &Arc<MetadataStore>, path: &str) -> Respo
     } else {
         Response::Error {
             message: format!("File not found: {}", path),
+        }
+    }
+}
+
+async fn handle_commit_block(
+    metadata_store: &Arc<MetadataStore>,
+    path: &str,
+    block_id: u64,
+    size: u64,
+    checksum: String,
+    replicas: Vec<String>,
+) -> Response {
+    if metadata_store
+        .commit_block(path, block_id, size, checksum, &replicas)
+        .await
+    {
+        Response::Ok
+    } else {
+        Response::Error {
+            message: format!("Failed to commit block {} for {}", block_id, path),
         }
     }
 }
