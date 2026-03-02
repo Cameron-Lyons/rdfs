@@ -115,6 +115,7 @@ fn load_from_db(conn: &rusqlite::Connection) -> DbSnapshot {
     let mut files: HashMap<String, FileInfo> = HashMap::new();
     let mut nodes: HashMap<String, NodeInfo> = HashMap::new();
     let mut block_to_nodes: HashMap<u64, HashSet<String>> = HashMap::new();
+    let mut block_index: HashMap<u64, (String, usize)> = HashMap::new();
     let mut max_block_id: u64 = 0;
 
     {
@@ -160,12 +161,14 @@ fn load_from_db(conn: &rusqlite::Connection) -> DbSnapshot {
                 max_block_id = block_id + 1;
             }
             if let Some(fi) = files.get_mut(&file_path) {
+                let block_pos = fi.blocks.len();
                 fi.blocks.push(BlockInfo {
                     block_id,
                     size,
                     checksum,
                     replicas: Vec::new(),
                 });
+                block_index.insert(block_id, (file_path, block_pos));
             }
         }
     }
@@ -190,14 +193,15 @@ fn load_from_db(conn: &rusqlite::Connection) -> DbSnapshot {
                 .entry(block_id)
                 .or_default()
                 .insert(node_id.clone());
-            for fi in files.values_mut() {
-                if let Some(block) = fi.blocks.iter_mut().find(|b| b.block_id == block_id) {
-                    block.replicas.push(ReplicaInfo {
-                        node_id: node_id.clone(),
-                        version,
-                        last_heartbeat,
-                    });
-                }
+            if let Some((file_path, block_pos)) = block_index.get(&block_id)
+                && let Some(fi) = files.get_mut(file_path)
+                && let Some(block) = fi.blocks.get_mut(*block_pos)
+            {
+                block.replicas.push(ReplicaInfo {
+                    node_id: node_id.clone(),
+                    version,
+                    last_heartbeat,
+                });
             }
         }
     }

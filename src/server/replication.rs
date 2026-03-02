@@ -1,5 +1,6 @@
 use crate::client::connection::{Envelope, Request, Response, auth_token};
 use crate::server::metadata::{MetadataStore, NodeInfo};
+use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -93,12 +94,12 @@ impl ReplicationManager {
                 let needed = self.replication_factor - replica_count;
                 let available_nodes = self.metadata_store.get_active_nodes().await;
 
-                let existing_node_ids: Vec<String> =
-                    block.replicas.iter().map(|r| r.node_id.clone()).collect();
+                let existing_node_ids: HashSet<&str> =
+                    block.replicas.iter().map(|r| r.node_id.as_str()).collect();
 
                 let new_nodes: Vec<NodeInfo> = available_nodes
                     .into_iter()
-                    .filter(|n| !existing_node_ids.contains(&n.id))
+                    .filter(|n| !existing_node_ids.contains(n.id.as_str()))
                     .take(needed)
                     .collect();
 

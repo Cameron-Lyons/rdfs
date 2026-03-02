@@ -4,14 +4,16 @@ use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::future::Future;
 use std::io::{Read as IoRead, Write as IoWrite};
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
-    sync::{Mutex, RwLock, Semaphore},
+    sync::{Mutex, OwnedSemaphorePermit, RwLock, Semaphore},
     time::{sleep, timeout},
 };
 
@@ -97,6 +99,49 @@ struct ConnectionPool {
     active_connections: Arc<AtomicUsize>,
 }
 
+struct CheckedOutConnection {
+    pool: ConnectionPool,
+    addr: String,
+    stream: Option<TcpStream>,
+    _permit: OwnedSemaphorePermit,
+}
+
+impl CheckedOutConnection {
+    fn new(
+        pool: ConnectionPool,
+        addr: String,
+        stream: TcpStream,
+        permit: OwnedSemaphorePermit,
+    ) -> Self {
+        Self {
+            pool,
+            addr,
+            stream: Some(stream),
+            _permit: permit,
+        }
+    }
+
+    fn stream_mut(&mut self) -> &mut TcpStream {
+        self.stream
+            .as_mut()
+            .expect("checked-out connection should always hold a stream")
+    }
+
+    async fn return_to_pool(mut self) {
+        if let Some(stream) = self.stream.take() {
+            self.pool.return_connection(&self.addr, stream).await;
+        }
+    }
+}
+
+impl Drop for CheckedOutConnection {
+    fn drop(&mut self) {
+        if self.stream.is_some() {
+            self.pool.active_connections.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+}
+
 impl ConnectionPool {
     fn new() -> Self {
         Self {
@@ -108,7 +153,7 @@ impl ConnectionPool {
         }
     }
 
-    async fn get_connection(&self, addr: &str) -> Result<TcpStream, DfsError> {
+    async fn get_connection(&self, addr: &str) -> Result<CheckedOutConnection, DfsError> {
         {
             let breakers = self.circuit_breakers.read().await;
             if let Some(breaker) = breakers.get(addr)
@@ -129,7 +174,7 @@ impl ConnectionPool {
                 .clone()
         };
 
-        let _permit = semaphore.acquire().await.map_err(|e| {
+        let permit = semaphore.clone().acquire_owned().await.map_err(|e| {
             DfsError::Network(format!("Failed to acquire connection permit: {}", e))
         })?;
 
@@ -147,7 +192,12 @@ impl ConnectionPool {
                             .as_secs(),
                     );
                     self.active_connections.fetch_add(1, Ordering::SeqCst);
-                    return Ok(conn);
+                    return Ok(CheckedOutConnection::new(
+                        self.clone(),
+                        addr.to_string(),
+                        conn,
+                        permit,
+                    ));
                 }
             }
         }
@@ -187,7 +237,9 @@ impl ConnectionPool {
             .map_err(|e| DfsError::Network(format!("Failed to set TCP no-delay: {}", e)))?;
 
         let mut connections = self.connections.write().await;
-        connections.insert(addr.to_string(), Arc::new(Mutex::new(None)));
+        connections
+            .entry(addr.to_string())
+            .or_insert_with(|| Arc::new(Mutex::new(None)));
 
         let mut last_used = self.last_used.write().await;
         last_used.insert(
@@ -199,7 +251,12 @@ impl ConnectionPool {
         );
 
         self.active_connections.fetch_add(1, Ordering::SeqCst);
-        Ok(stream)
+        Ok(CheckedOutConnection::new(
+            self.clone(),
+            addr.to_string(),
+            stream,
+            permit,
+        ))
     }
 
     async fn return_connection(&self, addr: &str, conn: TcpStream) {
@@ -352,19 +409,17 @@ impl ConnectionManager {
 
     async fn execute_with_retry<F, T>(&self, addr: &str, operation: F) -> Result<T, DfsError>
     where
-        F: Fn(
-            TcpStream,
-        ) -> std::pin::Pin<
-            Box<dyn std::future::Future<Output = Result<(TcpStream, T), DfsError>> + Send>,
-        >,
+        F: for<'a> Fn(
+            &'a mut TcpStream,
+        ) -> Pin<Box<dyn Future<Output = Result<T, DfsError>> + Send + 'a>>,
     {
         let mut last_error = None;
 
         for attempt in 1..=RETRY_ATTEMPTS {
             match self.connection_pool.get_connection(addr).await {
-                Ok(stream) => match operation(stream).await {
-                    Ok((stream, result)) => {
-                        self.connection_pool.return_connection(addr, stream).await;
+                Ok(mut checked_out) => match operation(checked_out.stream_mut()).await {
+                    Ok(result) => {
+                        checked_out.return_to_pool().await;
                         return Ok(result);
                     }
                     Err(e) => {
@@ -391,15 +446,15 @@ impl ConnectionManager {
     }
 
     pub async fn lookup_metadata(&self, path: &str) -> Result<FileMetadata, DfsError> {
-        self.execute_with_retry(&self.master_addr, |mut stream| {
+        self.execute_with_retry(&self.master_addr, |stream| {
             let path = path.to_string();
             Box::pin(async move {
                 let request = Request::Lookup { path };
-                send_request(&mut stream, &request).await?;
-                let response: Response = recv_response(&mut stream).await?;
+                send_request(stream, &request).await?;
+                let response: Response = recv_response(stream).await?;
 
                 match response {
-                    Response::Metadata { metadata } => Ok((stream, metadata)),
+                    Response::Metadata { metadata } => Ok(metadata),
                     Response::Error { message } => Err(DfsError::Network(message)),
                     _ => Err(DfsError::Unknown),
                 }
@@ -428,14 +483,14 @@ impl ConnectionManager {
 
         for node in &metadata.nodes {
             match self
-                .execute_with_retry(&node.addr, |mut stream| {
+                .execute_with_retry(&node.addr, |stream| {
                     Box::pin(async move {
                         let request = Request::ReadBlock { block_id };
-                        send_request(&mut stream, &request).await?;
-                        let response: Response = recv_response(&mut stream).await?;
+                        send_request(stream, &request).await?;
+                        let response: Response = recv_response(stream).await?;
 
                         match response {
-                            Response::BlockData { data } => Ok((stream, data)),
+                            Response::BlockData { data } => Ok(data),
                             Response::Error { message } => Err(DfsError::Network(message)),
                             _ => Err(DfsError::Unknown),
                         }
@@ -497,25 +552,29 @@ impl ConnectionManager {
 
             let task = tokio::spawn(async move {
                 match pool.get_connection(&node_addr).await {
-                    Ok(mut stream) => {
+                    Ok(mut checked_out) => {
                         let request = Request::WriteBlock {
                             block_id,
                             data: data.clone(),
                         };
 
-                        if let Err(e) = send_request(&mut stream, &request).await {
+                        if let Err(e) = send_request(checked_out.stream_mut(), &request).await {
                             return Err((node_addr, e));
                         }
 
-                        match recv_response(&mut stream).await {
+                        match recv_response(checked_out.stream_mut()).await {
                             Ok(Response::Ok) => {
-                                pool.return_connection(&node_addr, stream).await;
+                                checked_out.return_to_pool().await;
                                 Ok(node_id)
                             }
                             Ok(Response::Error { message }) => {
+                                checked_out.return_to_pool().await;
                                 Err((node_addr, DfsError::Network(message)))
                             }
-                            Ok(_) => Err((node_addr, DfsError::Unknown)),
+                            Ok(_) => {
+                                checked_out.return_to_pool().await;
+                                Err((node_addr, DfsError::Unknown))
+                            }
                             Err(e) => Err((node_addr, e)),
                         }
                     }
@@ -572,7 +631,7 @@ impl ConnectionManager {
         checksum: String,
         replicas: Vec<String>,
     ) -> Result<(), DfsError> {
-        self.execute_with_retry(&self.master_addr, |mut stream| {
+        self.execute_with_retry(&self.master_addr, |stream| {
             let path = path.to_string();
             let checksum = checksum.clone();
             let replicas = replicas.clone();
@@ -584,10 +643,10 @@ impl ConnectionManager {
                     checksum,
                     replicas,
                 };
-                send_request(&mut stream, &request).await?;
-                let response: Response = recv_response(&mut stream).await?;
+                send_request(stream, &request).await?;
+                let response: Response = recv_response(stream).await?;
                 match response {
-                    Response::Ok => Ok((stream, ())),
+                    Response::Ok => Ok(()),
                     Response::Error { message } => Err(DfsError::Network(message)),
                     _ => Err(DfsError::Unknown),
                 }
@@ -597,15 +656,15 @@ impl ConnectionManager {
     }
 
     pub async fn create_file(&self, path: &str) -> Result<FileMetadata, DfsError> {
-        self.execute_with_retry(&self.master_addr, |mut stream| {
+        self.execute_with_retry(&self.master_addr, |stream| {
             let path = path.to_string();
             Box::pin(async move {
                 let request = Request::Create { path };
-                send_request(&mut stream, &request).await?;
-                let response: Response = recv_response(&mut stream).await?;
+                send_request(stream, &request).await?;
+                let response: Response = recv_response(stream).await?;
 
                 match response {
-                    Response::Metadata { metadata } => Ok((stream, metadata)),
+                    Response::Metadata { metadata } => Ok(metadata),
                     Response::Error { message } => Err(DfsError::Network(message)),
                     _ => Err(DfsError::Unknown),
                 }
@@ -619,18 +678,18 @@ impl ConnectionManager {
         path: &str,
         replication_factor: usize,
     ) -> Result<FileMetadata, DfsError> {
-        self.execute_with_retry(&self.master_addr, |mut stream| {
+        self.execute_with_retry(&self.master_addr, |stream| {
             let path = path.to_string();
             Box::pin(async move {
                 let request = Request::CreateWithReplication {
                     path,
                     replication_factor,
                 };
-                send_request(&mut stream, &request).await?;
-                let response: Response = recv_response(&mut stream).await?;
+                send_request(stream, &request).await?;
+                let response: Response = recv_response(stream).await?;
 
                 match response {
-                    Response::Metadata { metadata } => Ok((stream, metadata)),
+                    Response::Metadata { metadata } => Ok(metadata),
                     Response::Error { message } => Err(DfsError::Network(message)),
                     _ => Err(DfsError::Unknown),
                 }
@@ -640,15 +699,15 @@ impl ConnectionManager {
     }
 
     pub async fn list_files(&self, path: &str) -> Result<Vec<FileInfo>, DfsError> {
-        self.execute_with_retry(&self.master_addr, |mut stream| {
+        self.execute_with_retry(&self.master_addr, |stream| {
             let path = path.to_string();
             Box::pin(async move {
                 let request = Request::List { path };
-                send_request(&mut stream, &request).await?;
-                let response: Response = recv_response(&mut stream).await?;
+                send_request(stream, &request).await?;
+                let response: Response = recv_response(stream).await?;
 
                 match response {
-                    Response::FileList { files } => Ok((stream, files)),
+                    Response::FileList { files } => Ok(files),
                     Response::Error { message } => Err(DfsError::Network(message)),
                     _ => Err(DfsError::Unknown),
                 }
@@ -658,16 +717,16 @@ impl ConnectionManager {
     }
 
     pub async fn rename_file(&self, from: &str, to: &str) -> Result<(), DfsError> {
-        self.execute_with_retry(&self.master_addr, |mut stream| {
+        self.execute_with_retry(&self.master_addr, |stream| {
             let from = from.to_string();
             let to = to.to_string();
             Box::pin(async move {
                 let request = Request::Rename { from, to };
-                send_request(&mut stream, &request).await?;
-                let response: Response = recv_response(&mut stream).await?;
+                send_request(stream, &request).await?;
+                let response: Response = recv_response(stream).await?;
 
                 match response {
-                    Response::Ok => Ok((stream, ())),
+                    Response::Ok => Ok(()),
                     Response::Error { message } => Err(DfsError::Network(message)),
                     _ => Err(DfsError::Unknown),
                 }
@@ -677,15 +736,15 @@ impl ConnectionManager {
     }
 
     pub async fn delete_file(&self, path: &str) -> Result<(), DfsError> {
-        self.execute_with_retry(&self.master_addr, |mut stream| {
+        self.execute_with_retry(&self.master_addr, |stream| {
             let path = path.to_string();
             Box::pin(async move {
                 let request = Request::Delete { path };
-                send_request(&mut stream, &request).await?;
-                let response: Response = recv_response(&mut stream).await?;
+                send_request(stream, &request).await?;
+                let response: Response = recv_response(stream).await?;
 
                 match response {
-                    Response::Ok => Ok((stream, ())),
+                    Response::Ok => Ok(()),
                     Response::Error { message } => Err(DfsError::Network(message)),
                     _ => Err(DfsError::Unknown),
                 }
