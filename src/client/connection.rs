@@ -1,373 +1,26 @@
 use crate::client::error::DfsError;
-use flate2::Compression;
-use flate2::read::GzDecoder;
-use flate2::write::GzEncoder;
-use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use std::future::Future;
-use std::io::{Read as IoRead, Write as IoWrite};
-use std::pin::Pin;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    net::TcpStream,
-    sync::{Mutex, OwnedSemaphorePermit, RwLock, Semaphore},
-    time::{sleep, timeout},
+use crate::protocol::{
+    DirectoryEntry, FileHandle, FileLayout, PROTOCOL_VERSION, ReplicaVersion, RpcEnvelope,
+    RpcRequest, RpcResponse, StorageNode, WriteSessionInfo, auth_token, recv_response,
+    send_envelope,
 };
+use std::collections::HashSet;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
+use tokio::net::TcpStream;
+use tokio::sync::RwLock;
+use tokio::time::{sleep, timeout};
 
 const CONNECTION_TIMEOUT: Duration = Duration::from_secs(5);
 const RETRY_ATTEMPTS: u32 = 3;
-const RETRY_DELAY: Duration = Duration::from_millis(500);
-const MAX_CONNECTIONS_PER_HOST: usize = 10;
-const CIRCUIT_BREAKER_THRESHOLD: u64 = 5;
-const CIRCUIT_BREAKER_RESET_TIME: Duration = Duration::from_secs(30);
-
-type ConnectionMap = Arc<RwLock<HashMap<String, Arc<Mutex<Option<TcpStream>>>>>>;
-
-#[derive(Clone)]
-struct CircuitBreaker {
-    failure_count: Arc<AtomicU64>,
-    last_failure_time: Arc<RwLock<Option<SystemTime>>>,
-    state: Arc<RwLock<CircuitState>>,
-}
-
-#[derive(Clone, Debug)]
-enum CircuitState {
-    Closed,
-    Open,
-    HalfOpen,
-}
-
-impl CircuitBreaker {
-    fn new() -> Self {
-        Self {
-            failure_count: Arc::new(AtomicU64::new(0)),
-            last_failure_time: Arc::new(RwLock::new(None)),
-            state: Arc::new(RwLock::new(CircuitState::Closed)),
-        }
-    }
-
-    async fn record_success(&self) {
-        self.failure_count.store(0, Ordering::SeqCst);
-        *self.state.write().await = CircuitState::Closed;
-        *self.last_failure_time.write().await = None;
-    }
-
-    async fn record_failure(&self) {
-        let failures = self.failure_count.fetch_add(1, Ordering::SeqCst) + 1;
-        *self.last_failure_time.write().await = Some(SystemTime::now());
-
-        if failures >= CIRCUIT_BREAKER_THRESHOLD {
-            *self.state.write().await = CircuitState::Open;
-        }
-    }
-
-    async fn can_attempt(&self) -> bool {
-        let state = self.state.read().await;
-        match *state {
-            CircuitState::Closed => true,
-            CircuitState::Open => {
-                if let Some(last_failure) = *self.last_failure_time.read().await {
-                    if SystemTime::now()
-                        .duration_since(last_failure)
-                        .unwrap_or(Duration::ZERO)
-                        > CIRCUIT_BREAKER_RESET_TIME
-                    {
-                        drop(state);
-                        *self.state.write().await = CircuitState::HalfOpen;
-                        true
-                    } else {
-                        false
-                    }
-                } else {
-                    true
-                }
-            }
-            CircuitState::HalfOpen => true,
-        }
-    }
-}
-
-#[derive(Clone)]
-struct ConnectionPool {
-    connections: ConnectionMap,
-    last_used: Arc<RwLock<HashMap<String, u64>>>,
-    semaphores: Arc<RwLock<HashMap<String, Arc<Semaphore>>>>,
-    circuit_breakers: Arc<RwLock<HashMap<String, CircuitBreaker>>>,
-    active_connections: Arc<AtomicUsize>,
-}
-
-struct CheckedOutConnection {
-    pool: ConnectionPool,
-    addr: String,
-    stream: Option<TcpStream>,
-    _permit: OwnedSemaphorePermit,
-}
-
-impl CheckedOutConnection {
-    fn new(
-        pool: ConnectionPool,
-        addr: String,
-        stream: TcpStream,
-        permit: OwnedSemaphorePermit,
-    ) -> Self {
-        Self {
-            pool,
-            addr,
-            stream: Some(stream),
-            _permit: permit,
-        }
-    }
-
-    fn stream_mut(&mut self) -> &mut TcpStream {
-        self.stream
-            .as_mut()
-            .expect("checked-out connection should always hold a stream")
-    }
-
-    async fn return_to_pool(mut self) {
-        if let Some(stream) = self.stream.take() {
-            self.pool.return_connection(&self.addr, stream).await;
-        }
-    }
-}
-
-impl Drop for CheckedOutConnection {
-    fn drop(&mut self) {
-        if self.stream.is_some() {
-            self.pool.active_connections.fetch_sub(1, Ordering::SeqCst);
-        }
-    }
-}
-
-impl ConnectionPool {
-    fn new() -> Self {
-        Self {
-            connections: Arc::new(RwLock::new(HashMap::new())),
-            last_used: Arc::new(RwLock::new(HashMap::new())),
-            semaphores: Arc::new(RwLock::new(HashMap::new())),
-            circuit_breakers: Arc::new(RwLock::new(HashMap::new())),
-            active_connections: Arc::new(AtomicUsize::new(0)),
-        }
-    }
-
-    async fn get_connection(&self, addr: &str) -> Result<CheckedOutConnection, DfsError> {
-        {
-            let breakers = self.circuit_breakers.read().await;
-            if let Some(breaker) = breakers.get(addr)
-                && !breaker.can_attempt().await
-            {
-                return Err(DfsError::Network(format!(
-                    "Circuit breaker open for {}",
-                    addr
-                )));
-            }
-        }
-
-        let semaphore = {
-            let mut semaphores = self.semaphores.write().await;
-            semaphores
-                .entry(addr.to_string())
-                .or_insert_with(|| Arc::new(Semaphore::new(MAX_CONNECTIONS_PER_HOST)))
-                .clone()
-        };
-
-        let permit = semaphore.clone().acquire_owned().await.map_err(|e| {
-            DfsError::Network(format!("Failed to acquire connection permit: {}", e))
-        })?;
-
-        {
-            let connections = self.connections.read().await;
-            if let Some(conn_mutex) = connections.get(addr) {
-                let mut conn_opt = conn_mutex.lock().await;
-                if let Some(conn) = conn_opt.take() {
-                    let mut last_used = self.last_used.write().await;
-                    last_used.insert(
-                        addr.to_string(),
-                        SystemTime::now()
-                            .duration_since(UNIX_EPOCH)
-                            .unwrap()
-                            .as_secs(),
-                    );
-                    self.active_connections.fetch_add(1, Ordering::SeqCst);
-                    return Ok(CheckedOutConnection::new(
-                        self.clone(),
-                        addr.to_string(),
-                        conn,
-                        permit,
-                    ));
-                }
-            }
-        }
-
-        let stream = match timeout(CONNECTION_TIMEOUT, TcpStream::connect(addr)).await {
-            Ok(Ok(stream)) => {
-                let mut breakers = self.circuit_breakers.write().await;
-                let breaker = breakers
-                    .entry(addr.to_string())
-                    .or_insert_with(CircuitBreaker::new);
-                breaker.record_success().await;
-                stream
-            }
-            Ok(Err(e)) => {
-                let mut breakers = self.circuit_breakers.write().await;
-                let breaker = breakers
-                    .entry(addr.to_string())
-                    .or_insert_with(CircuitBreaker::new);
-                breaker.record_failure().await;
-                return Err(DfsError::Network(format!(
-                    "Failed to connect to {}: {}",
-                    addr, e
-                )));
-            }
-            Err(_) => {
-                let mut breakers = self.circuit_breakers.write().await;
-                let breaker = breakers
-                    .entry(addr.to_string())
-                    .or_insert_with(CircuitBreaker::new);
-                breaker.record_failure().await;
-                return Err(DfsError::Network(format!("Connection timeout to {}", addr)));
-            }
-        };
-
-        stream
-            .set_nodelay(true)
-            .map_err(|e| DfsError::Network(format!("Failed to set TCP no-delay: {}", e)))?;
-
-        let mut connections = self.connections.write().await;
-        connections
-            .entry(addr.to_string())
-            .or_insert_with(|| Arc::new(Mutex::new(None)));
-
-        let mut last_used = self.last_used.write().await;
-        last_used.insert(
-            addr.to_string(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_secs(),
-        );
-
-        self.active_connections.fetch_add(1, Ordering::SeqCst);
-        Ok(CheckedOutConnection::new(
-            self.clone(),
-            addr.to_string(),
-            stream,
-            permit,
-        ))
-    }
-
-    async fn return_connection(&self, addr: &str, conn: TcpStream) {
-        let connections = self.connections.read().await;
-        if let Some(conn_mutex) = connections.get(addr) {
-            let mut conn_opt = conn_mutex.lock().await;
-            *conn_opt = Some(conn);
-        }
-        self.active_connections.fetch_sub(1, Ordering::SeqCst);
-    }
-
-    async fn cleanup_stale_connections(&self) {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-
-        let last_used = self.last_used.read().await;
-        let stale_addrs: Vec<String> = last_used
-            .iter()
-            .filter(|(_, last)| now - **last > 60)
-            .map(|(addr, _)| addr.clone())
-            .collect();
-
-        drop(last_used);
-
-        if !stale_addrs.is_empty() {
-            let mut connections = self.connections.write().await;
-            let mut last_used = self.last_used.write().await;
-
-            for addr in stale_addrs {
-                connections.remove(&addr);
-                last_used.remove(&addr);
-            }
-        }
-    }
-}
-
-#[derive(Clone)]
-struct BlockCache {
-    cache: Arc<RwLock<HashMap<u64, CachedBlock>>>,
-    max_size: usize,
-    current_size: Arc<AtomicUsize>,
-}
-
-#[derive(Clone)]
-struct CachedBlock {
-    data: Vec<u8>,
-    last_accessed: SystemTime,
-    access_count: u64,
-}
-
-impl BlockCache {
-    fn new(max_size_mb: usize) -> Self {
-        Self {
-            cache: Arc::new(RwLock::new(HashMap::new())),
-            max_size: max_size_mb * 1024 * 1024,
-            current_size: Arc::new(AtomicUsize::new(0)),
-        }
-    }
-
-    async fn get(&self, block_id: u64) -> Option<Vec<u8>> {
-        let mut cache = self.cache.write().await;
-        if let Some(block) = cache.get_mut(&block_id) {
-            block.last_accessed = SystemTime::now();
-            block.access_count += 1;
-            Some(block.data.clone())
-        } else {
-            None
-        }
-    }
-
-    async fn put(&self, block_id: u64, data: Vec<u8>) {
-        let data_size = data.len();
-
-        while self.current_size.load(Ordering::SeqCst) + data_size > self.max_size {
-            self.evict_lru().await;
-        }
-
-        let mut cache = self.cache.write().await;
-        cache.insert(
-            block_id,
-            CachedBlock {
-                data,
-                last_accessed: SystemTime::now(),
-                access_count: 1,
-            },
-        );
-
-        self.current_size.fetch_add(data_size, Ordering::SeqCst);
-    }
-
-    async fn evict_lru(&self) {
-        let mut cache = self.cache.write().await;
-        if let Some((oldest_id, oldest_block)) =
-            cache.iter().min_by_key(|(_, block)| block.last_accessed)
-        {
-            let oldest_id = *oldest_id;
-            let size = oldest_block.data.len();
-            cache.remove(&oldest_id);
-            self.current_size.fetch_sub(size, Ordering::SeqCst);
-        }
-    }
-}
+const RETRY_BACKOFF: Duration = Duration::from_millis(250);
 
 #[derive(Clone)]
 pub struct ConnectionManager {
     master_addr: String,
-    connection_pool: ConnectionPool,
-    connection_stats: Arc<RwLock<ConnectionStats>>,
-    block_cache: BlockCache,
+    stats: Arc<RwLock<ConnectionStats>>,
+    request_id: Arc<AtomicU64>,
 }
 
 #[derive(Default)]
@@ -379,392 +32,6 @@ struct ConnectionStats {
     last_error: Option<String>,
 }
 
-impl ConnectionManager {
-    pub async fn connect(master_addr: &str) -> Result<Self, DfsError> {
-        let connection_pool = ConnectionPool::new();
-
-        let _test_stream = timeout(CONNECTION_TIMEOUT, TcpStream::connect(master_addr))
-            .await
-            .map_err(|_| DfsError::Network(format!("Cannot reach master at {}", master_addr)))?
-            .map_err(|e| DfsError::Network(format!("Failed to connect to master: {}", e)))?;
-
-        let manager = Self {
-            master_addr: master_addr.to_string(),
-            connection_pool,
-            connection_stats: Arc::new(RwLock::new(ConnectionStats::default())),
-            block_cache: BlockCache::new(100),
-        };
-
-        let pool = manager.connection_pool.clone();
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(30));
-            loop {
-                interval.tick().await;
-                pool.cleanup_stale_connections().await;
-            }
-        });
-
-        Ok(manager)
-    }
-
-    async fn execute_with_retry<F, T>(&self, addr: &str, operation: F) -> Result<T, DfsError>
-    where
-        F: for<'a> Fn(
-            &'a mut TcpStream,
-        ) -> Pin<Box<dyn Future<Output = Result<T, DfsError>> + Send + 'a>>,
-    {
-        let mut last_error = None;
-
-        for attempt in 1..=RETRY_ATTEMPTS {
-            match self.connection_pool.get_connection(addr).await {
-                Ok(mut checked_out) => match operation(checked_out.stream_mut()).await {
-                    Ok(result) => {
-                        checked_out.return_to_pool().await;
-                        return Ok(result);
-                    }
-                    Err(e) => {
-                        last_error = Some(e);
-                        if attempt < RETRY_ATTEMPTS {
-                            sleep(RETRY_DELAY * attempt).await;
-                        }
-                    }
-                },
-                Err(e) => {
-                    last_error = Some(e);
-                    if attempt < RETRY_ATTEMPTS {
-                        sleep(RETRY_DELAY * attempt).await;
-                    }
-                }
-            }
-        }
-
-        let mut stats = self.connection_stats.write().await;
-        stats.failed_requests += 1;
-        stats.last_error = Some(format!("Failed after {} attempts", RETRY_ATTEMPTS));
-
-        Err(last_error.unwrap_or(DfsError::Unknown))
-    }
-
-    pub async fn lookup_metadata(&self, path: &str) -> Result<FileMetadata, DfsError> {
-        self.execute_with_retry(&self.master_addr, |stream| {
-            let path = path.to_string();
-            Box::pin(async move {
-                let request = Request::Lookup { path };
-                send_request(stream, &request).await?;
-                let response: Response = recv_response(stream).await?;
-
-                match response {
-                    Response::Metadata { metadata } => Ok(metadata),
-                    Response::Error { message } => Err(DfsError::Network(message)),
-                    _ => Err(DfsError::Unknown),
-                }
-            })
-        })
-        .await
-    }
-
-    pub async fn read_block(
-        &self,
-        metadata: &FileMetadata,
-        block_id: u64,
-    ) -> Result<Vec<u8>, DfsError> {
-        if let Some(data) = self.block_cache.get(block_id).await {
-            let mut stats = self.connection_stats.write().await;
-            stats.total_requests += 1;
-            stats.bytes_received += data.len() as u64;
-            return Ok(data);
-        }
-
-        if metadata.nodes.is_empty() {
-            return Err(DfsError::Network("No storage nodes available".into()));
-        }
-
-        let mut last_error = None;
-
-        for node in &metadata.nodes {
-            match self
-                .execute_with_retry(&node.addr, |stream| {
-                    Box::pin(async move {
-                        let request = Request::ReadBlock { block_id };
-                        send_request(stream, &request).await?;
-                        let response: Response = recv_response(stream).await?;
-
-                        match response {
-                            Response::BlockData { data } => Ok(data),
-                            Response::Error { message } => Err(DfsError::Network(message)),
-                            _ => Err(DfsError::Unknown),
-                        }
-                    })
-                })
-                .await
-            {
-                Ok(raw) => {
-                    let data = decompress(&raw)?;
-                    self.block_cache.put(block_id, data.clone()).await;
-
-                    let mut stats = self.connection_stats.write().await;
-                    stats.total_requests += 1;
-                    stats.bytes_received += data.len() as u64;
-                    return Ok(data);
-                }
-                Err(e) => {
-                    last_error = Some(e);
-                }
-            }
-        }
-
-        let mut stats = self.connection_stats.write().await;
-        stats.failed_requests += 1;
-        stats.last_error = Some(format!(
-            "Failed to read block {} from any replica",
-            block_id
-        ));
-
-        Err(last_error.unwrap_or_else(|| {
-            DfsError::Network(format!("Failed to read block {} from any node", block_id))
-        }))
-    }
-
-    pub async fn write_block(
-        &self,
-        metadata: &FileMetadata,
-        block_id: u64,
-        data: &[u8],
-    ) -> Result<(), DfsError> {
-        if metadata.nodes.is_empty() {
-            return Err(DfsError::Network("No storage nodes available".into()));
-        }
-
-        let mut successful_writes = 0;
-        let required_writes = metadata.nodes.len().div_ceil(2);
-        let mut errors = Vec::new();
-        let mut successful_replicas = Vec::new();
-
-        let compressed = compress(data);
-        let checksum = checksum_hex(&compressed);
-
-        let mut write_tasks = Vec::new();
-        for node in &metadata.nodes {
-            let node_id = node.id.clone();
-            let node_addr = node.addr.clone();
-            let data = compressed.clone();
-            let pool = self.connection_pool.clone();
-
-            let task = tokio::spawn(async move {
-                match pool.get_connection(&node_addr).await {
-                    Ok(mut checked_out) => {
-                        let request = Request::WriteBlock {
-                            block_id,
-                            data: data.clone(),
-                        };
-
-                        if let Err(e) = send_request(checked_out.stream_mut(), &request).await {
-                            return Err((node_addr, e));
-                        }
-
-                        match recv_response(checked_out.stream_mut()).await {
-                            Ok(Response::Ok) => {
-                                checked_out.return_to_pool().await;
-                                Ok(node_id)
-                            }
-                            Ok(Response::Error { message }) => {
-                                checked_out.return_to_pool().await;
-                                Err((node_addr, DfsError::Network(message)))
-                            }
-                            Ok(_) => {
-                                checked_out.return_to_pool().await;
-                                Err((node_addr, DfsError::Unknown))
-                            }
-                            Err(e) => Err((node_addr, e)),
-                        }
-                    }
-                    Err(e) => Err((node_addr, e)),
-                }
-            });
-
-            write_tasks.push(task);
-        }
-
-        for task in write_tasks {
-            match task.await {
-                Ok(Ok(node_id)) => {
-                    successful_writes += 1;
-                    successful_replicas.push(node_id);
-                }
-                Ok(Err((addr, e))) => errors.push(format!("{}: {}", addr, e)),
-                Err(e) => errors.push(format!("Task error: {}", e)),
-            }
-        }
-
-        let mut stats = self.connection_stats.write().await;
-        stats.total_requests += metadata.nodes.len() as u64;
-        stats.bytes_sent += (compressed.len() * metadata.nodes.len()) as u64;
-
-        if successful_writes >= required_writes {
-            self.commit_block(
-                &metadata.path,
-                block_id,
-                data.len() as u64,
-                checksum,
-                successful_replicas,
-            )
-            .await
-        } else {
-            stats.failed_requests += (metadata.nodes.len() - successful_writes) as u64;
-            stats.last_error = Some(format!(
-                "Insufficient replicas. Required: {}, Successful: {}. Errors: {:?}",
-                required_writes, successful_writes, errors
-            ));
-
-            Err(DfsError::Network(format!(
-                "Failed to write to sufficient replicas. Required: {}, Successful: {}",
-                required_writes, successful_writes
-            )))
-        }
-    }
-
-    async fn commit_block(
-        &self,
-        path: &str,
-        block_id: u64,
-        size: u64,
-        checksum: String,
-        replicas: Vec<String>,
-    ) -> Result<(), DfsError> {
-        self.execute_with_retry(&self.master_addr, |stream| {
-            let path = path.to_string();
-            let checksum = checksum.clone();
-            let replicas = replicas.clone();
-            Box::pin(async move {
-                let request = Request::CommitBlock {
-                    path,
-                    block_id,
-                    size,
-                    checksum,
-                    replicas,
-                };
-                send_request(stream, &request).await?;
-                let response: Response = recv_response(stream).await?;
-                match response {
-                    Response::Ok => Ok(()),
-                    Response::Error { message } => Err(DfsError::Network(message)),
-                    _ => Err(DfsError::Unknown),
-                }
-            })
-        })
-        .await
-    }
-
-    pub async fn create_file(&self, path: &str) -> Result<FileMetadata, DfsError> {
-        self.execute_with_retry(&self.master_addr, |stream| {
-            let path = path.to_string();
-            Box::pin(async move {
-                let request = Request::Create { path };
-                send_request(stream, &request).await?;
-                let response: Response = recv_response(stream).await?;
-
-                match response {
-                    Response::Metadata { metadata } => Ok(metadata),
-                    Response::Error { message } => Err(DfsError::Network(message)),
-                    _ => Err(DfsError::Unknown),
-                }
-            })
-        })
-        .await
-    }
-
-    pub async fn create_file_with_replication(
-        &self,
-        path: &str,
-        replication_factor: usize,
-    ) -> Result<FileMetadata, DfsError> {
-        self.execute_with_retry(&self.master_addr, |stream| {
-            let path = path.to_string();
-            Box::pin(async move {
-                let request = Request::CreateWithReplication {
-                    path,
-                    replication_factor,
-                };
-                send_request(stream, &request).await?;
-                let response: Response = recv_response(stream).await?;
-
-                match response {
-                    Response::Metadata { metadata } => Ok(metadata),
-                    Response::Error { message } => Err(DfsError::Network(message)),
-                    _ => Err(DfsError::Unknown),
-                }
-            })
-        })
-        .await
-    }
-
-    pub async fn list_files(&self, path: &str) -> Result<Vec<FileInfo>, DfsError> {
-        self.execute_with_retry(&self.master_addr, |stream| {
-            let path = path.to_string();
-            Box::pin(async move {
-                let request = Request::List { path };
-                send_request(stream, &request).await?;
-                let response: Response = recv_response(stream).await?;
-
-                match response {
-                    Response::FileList { files } => Ok(files),
-                    Response::Error { message } => Err(DfsError::Network(message)),
-                    _ => Err(DfsError::Unknown),
-                }
-            })
-        })
-        .await
-    }
-
-    pub async fn rename_file(&self, from: &str, to: &str) -> Result<(), DfsError> {
-        self.execute_with_retry(&self.master_addr, |stream| {
-            let from = from.to_string();
-            let to = to.to_string();
-            Box::pin(async move {
-                let request = Request::Rename { from, to };
-                send_request(stream, &request).await?;
-                let response: Response = recv_response(stream).await?;
-
-                match response {
-                    Response::Ok => Ok(()),
-                    Response::Error { message } => Err(DfsError::Network(message)),
-                    _ => Err(DfsError::Unknown),
-                }
-            })
-        })
-        .await
-    }
-
-    pub async fn delete_file(&self, path: &str) -> Result<(), DfsError> {
-        self.execute_with_retry(&self.master_addr, |stream| {
-            let path = path.to_string();
-            Box::pin(async move {
-                let request = Request::Delete { path };
-                send_request(stream, &request).await?;
-                let response: Response = recv_response(stream).await?;
-
-                match response {
-                    Response::Ok => Ok(()),
-                    Response::Error { message } => Err(DfsError::Network(message)),
-                    _ => Err(DfsError::Unknown),
-                }
-            })
-        })
-        .await
-    }
-
-    pub async fn get_stats(&self) -> ConnectionStatsSnapshot {
-        let stats = self.connection_stats.read().await;
-        ConnectionStatsSnapshot {
-            total_requests: stats.total_requests,
-            failed_requests: stats.failed_requests,
-            bytes_sent: stats.bytes_sent,
-            bytes_received: stats.bytes_received,
-            last_error: stats.last_error.clone(),
-        }
-    }
-}
-
 #[derive(Debug, Clone)]
 pub struct ConnectionStatsSnapshot {
     pub total_requests: u64,
@@ -774,140 +41,470 @@ pub struct ConnectionStatsSnapshot {
     pub last_error: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum Request {
-    Lookup {
-        path: String,
-    },
-    Create {
-        path: String,
-    },
-    CreateWithReplication {
-        path: String,
+impl ConnectionManager {
+    pub async fn connect(master_addr: &str) -> Result<Self, DfsError> {
+        let _ = timeout(CONNECTION_TIMEOUT, TcpStream::connect(master_addr))
+            .await
+            .map_err(|_| DfsError::Network(format!("cannot reach master at {master_addr}")))?
+            .map_err(|e| DfsError::Network(format!("failed to connect to master: {e}")))?;
+
+        Ok(Self {
+            master_addr: master_addr.to_string(),
+            stats: Arc::new(RwLock::new(ConnectionStats::default())),
+            request_id: Arc::new(AtomicU64::new(1)),
+        })
+    }
+
+    pub async fn create_directory(&self, path: &str) -> Result<(), DfsError> {
+        self.expect_ok(
+            self.request_master(RpcRequest::CreateDirectory {
+                path: path.to_string(),
+            })
+            .await?,
+        )
+    }
+
+    pub async fn create_file(
+        &self,
+        path: &str,
         replication_factor: usize,
-    },
-    List {
-        path: String,
-    },
-    ReadBlock {
-        block_id: u64,
-    },
-    WriteBlock {
-        block_id: u64,
-        data: Vec<u8>,
-    },
-    CommitBlock {
-        path: String,
-        block_id: u64,
+    ) -> Result<FileHandle, DfsError> {
+        let response = self
+            .request_master(RpcRequest::CreateFile {
+                path: path.to_string(),
+                replication_factor,
+            })
+            .await?;
+
+        match response {
+            RpcResponse::FileHandle { handle } => Ok(handle),
+            RpcResponse::Error { error } => Err(error.into()),
+            _ => Err(DfsError::Protocol(
+                "unexpected response for CreateFile".to_string(),
+            )),
+        }
+    }
+
+    pub async fn resolve_path(&self, path: &str) -> Result<FileHandle, DfsError> {
+        let response = self
+            .request_master(RpcRequest::ResolvePath {
+                path: path.to_string(),
+            })
+            .await?;
+
+        match response {
+            RpcResponse::FileHandle { handle } => Ok(handle),
+            RpcResponse::Error { error } => Err(error.into()),
+            _ => Err(DfsError::Protocol(
+                "unexpected response for ResolvePath".to_string(),
+            )),
+        }
+    }
+
+    pub async fn list_directory(&self, path: &str) -> Result<Vec<DirectoryEntry>, DfsError> {
+        let response = self
+            .request_master(RpcRequest::ListDirectory {
+                path: path.to_string(),
+            })
+            .await?;
+
+        match response {
+            RpcResponse::DirectoryEntries { entries } => Ok(entries),
+            RpcResponse::Error { error } => Err(error.into()),
+            _ => Err(DfsError::Protocol(
+                "unexpected response for ListDirectory".to_string(),
+            )),
+        }
+    }
+
+    pub async fn rename_entry(&self, from: &str, to: &str) -> Result<(), DfsError> {
+        self.expect_ok(
+            self.request_master(RpcRequest::RenameEntry {
+                from: from.to_string(),
+                to: to.to_string(),
+            })
+            .await?,
+        )
+    }
+
+    pub async fn delete_entry(&self, path: &str) -> Result<(), DfsError> {
+        self.expect_ok(
+            self.request_master(RpcRequest::DeleteEntry {
+                path: path.to_string(),
+            })
+            .await?,
+        )
+    }
+
+    pub async fn get_file_layout(
+        &self,
+        file_id: u64,
+        expected_generation: Option<u64>,
+    ) -> Result<FileLayout, DfsError> {
+        let response = self
+            .request_master(RpcRequest::GetFileLayout {
+                file_id,
+                expected_generation,
+            })
+            .await?;
+
+        match response {
+            RpcResponse::FileLayout { layout } => Ok(layout),
+            RpcResponse::Error { error } => Err(error.into()),
+            _ => Err(DfsError::Protocol(
+                "unexpected response for GetFileLayout".to_string(),
+            )),
+        }
+    }
+
+    pub async fn begin_write(
+        &self,
+        file_id: u64,
+        expected_generation: u64,
+    ) -> Result<WriteSessionInfo, DfsError> {
+        let response = self
+            .request_master(RpcRequest::BeginWrite {
+                file_id,
+                expected_generation,
+            })
+            .await?;
+
+        match response {
+            RpcResponse::WriteSession { session } => Ok(session),
+            RpcResponse::Error { error } => Err(error.into()),
+            _ => Err(DfsError::Protocol(
+                "unexpected response for BeginWrite".to_string(),
+            )),
+        }
+    }
+
+    pub async fn allocate_write_chunk(
+        &self,
+        session_id: u64,
         size: u64,
         checksum: String,
-        replicas: Vec<String>,
-    },
-    Delete {
-        path: String,
-    },
-    Rename {
-        from: String,
-        to: String,
-    },
-}
+    ) -> Result<(u64, Vec<StorageNode>), DfsError> {
+        let response = self
+            .request_master(RpcRequest::AllocateWriteChunk {
+                session_id,
+                size,
+                checksum,
+            })
+            .await?;
 
-#[derive(Debug, Serialize, Deserialize)]
-pub enum Response {
-    Ok,
-    Error { message: String },
-    Metadata { metadata: FileMetadata },
-    BlockData { data: Vec<u8> },
-    FileList { files: Vec<FileInfo> },
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FileInfo {
-    pub path: String,
-    pub size: u64,
-    pub is_dir: bool,
-    pub created_at: u64,
-    pub modified_at: u64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FileMetadata {
-    pub path: String,
-    pub size: u64,
-    pub blocks: Vec<u64>,
-    pub nodes: Vec<StorageNode>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct StorageNode {
-    pub id: String,
-    pub addr: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Envelope {
-    pub token: Option<String>,
-    pub payload: Request,
-}
-
-pub fn auth_token() -> Option<String> {
-    std::env::var("RDFS_AUTH_TOKEN").ok()
-}
-
-pub fn compress(data: &[u8]) -> Vec<u8> {
-    let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
-    encoder.write_all(data).expect("compression write failed");
-    encoder.finish().expect("compression finish failed")
-}
-
-pub fn decompress(data: &[u8]) -> Result<Vec<u8>, DfsError> {
-    let mut decoder = GzDecoder::new(data);
-    let mut buf = Vec::new();
-    decoder
-        .read_to_end(&mut buf)
-        .map_err(|e| DfsError::Network(format!("decompression failed: {e}")))?;
-    Ok(buf)
-}
-
-fn checksum_hex(data: &[u8]) -> String {
-    let mut hash: u64 = 0xcbf29ce484222325;
-    for byte in data {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x100000001b3);
-    }
-    format!("{:016x}", hash)
-}
-
-async fn send_request(stream: &mut TcpStream, req: &Request) -> Result<(), DfsError> {
-    let envelope = Envelope {
-        token: auth_token(),
-        payload: req.clone(),
-    };
-    let msg = serde_json::to_vec(&envelope).map_err(|e| DfsError::Network(e.to_string()))?;
-    let len = (msg.len() as u32).to_be_bytes();
-
-    stream.write_all(&len).await?;
-    stream.write_all(&msg).await?;
-    stream.flush().await?;
-    Ok(())
-}
-
-async fn recv_response(stream: &mut TcpStream) -> Result<Response, DfsError> {
-    let mut len_buf = [0u8; 4];
-    stream.read_exact(&mut len_buf).await?;
-    let len = u32::from_be_bytes(len_buf) as usize;
-
-    if len > 100 * 1024 * 1024 {
-        return Err(DfsError::Network(format!(
-            "Response too large: {} bytes",
-            len
-        )));
+        match response {
+            RpcResponse::AllocatedChunk { block_id, nodes } => Ok((block_id, nodes)),
+            RpcResponse::Error { error } => Err(error.into()),
+            _ => Err(DfsError::Protocol(
+                "unexpected response for AllocateWriteChunk".to_string(),
+            )),
+        }
     }
 
-    let mut buf = vec![0u8; len];
-    stream.read_exact(&mut buf).await?;
+    pub async fn finalize_write_chunk(
+        &self,
+        session_id: u64,
+        block_id: u64,
+        replicas: Vec<ReplicaVersion>,
+    ) -> Result<(), DfsError> {
+        self.expect_ok(
+            self.request_master(RpcRequest::FinalizeWriteChunk {
+                session_id,
+                block_id,
+                replicas,
+            })
+            .await?,
+        )
+    }
 
-    let resp: Response =
-        serde_json::from_slice(&buf).map_err(|e| DfsError::Network(e.to_string()))?;
-    Ok(resp)
+    pub async fn commit_write(&self, session_id: u64) -> Result<FileHandle, DfsError> {
+        let response = self
+            .request_master(RpcRequest::CommitWrite { session_id })
+            .await?;
+
+        match response {
+            RpcResponse::FileHandle { handle } => Ok(handle),
+            RpcResponse::Error { error } => Err(error.into()),
+            _ => Err(DfsError::Protocol(
+                "unexpected response for CommitWrite".to_string(),
+            )),
+        }
+    }
+
+    pub async fn abort_write(&self, session_id: u64) -> Result<(), DfsError> {
+        self.expect_ok(
+            self.request_master(RpcRequest::AbortWrite { session_id })
+                .await?,
+        )
+    }
+
+    pub async fn read_block(
+        &self,
+        layout: &FileLayout,
+        block_id: u64,
+    ) -> Result<Vec<u8>, DfsError> {
+        let Some(block) = layout.blocks.iter().find(|b| b.block_id == block_id) else {
+            return Err(DfsError::Protocol(format!(
+                "block {} not in file layout",
+                block_id
+            )));
+        };
+
+        if block.replicas.is_empty() {
+            return Err(DfsError::Network(format!(
+                "no replicas available for block {}",
+                block_id
+            )));
+        }
+
+        let mut reads = Vec::new();
+        for replica in &block.replicas {
+            let addr = replica.addr.clone();
+            let node_id = replica.node_id.clone();
+            let manager = self.clone();
+            reads.push(tokio::spawn(async move {
+                let response = manager
+                    .request_addr(&addr, RpcRequest::ReadBlock { block_id })
+                    .await;
+                (node_id, response)
+            }));
+        }
+
+        let mut successful = Vec::new();
+        let mut failures = Vec::new();
+        for task in reads {
+            match task.await {
+                Ok((node_id, Ok(RpcResponse::BlockPayload { block }))) => {
+                    successful.push((node_id, block));
+                }
+                Ok((node_id, Ok(RpcResponse::Error { error }))) => {
+                    failures.push(format!("{}: {}", node_id, error.message));
+                }
+                Ok((node_id, Ok(other))) => {
+                    failures.push(format!("{}: unexpected response {:?}", node_id, other));
+                }
+                Ok((node_id, Err(e))) => {
+                    failures.push(format!("{}: {}", node_id, e));
+                }
+                Err(e) => failures.push(format!("task join error: {}", e)),
+            }
+        }
+
+        if successful.is_empty() {
+            return Err(DfsError::Network(format!(
+                "failed to read block {} from all replicas: {:?}",
+                block_id, failures
+            )));
+        }
+
+        successful.sort_by_key(|(_, payload)| payload.version);
+        let (_, newest) = successful
+            .last()
+            .expect("successful reads should not be empty");
+
+        let conflicts = successful
+            .iter()
+            .filter(|(_, payload)| payload.version == newest.version)
+            .map(|(_, payload)| payload.checksum.clone())
+            .collect::<HashSet<_>>();
+
+        if conflicts.len() > 1 {
+            return Err(DfsError::Protocol(format!(
+                "conflicting checksums detected for block {} at version {}",
+                block_id, newest.version
+            )));
+        }
+
+        // Read-repair older replicas in the background.
+        for (node_id, payload) in &successful {
+            if payload.version >= newest.version {
+                continue;
+            }
+            if let Some(replica) = block.replicas.iter().find(|r| r.node_id == *node_id) {
+                let manager = self.clone();
+                let addr = replica.addr.clone();
+                let checksum = newest.checksum.clone();
+                let data = newest.data.clone();
+                let node_id = node_id.clone();
+                let version = newest.version;
+
+                tokio::spawn(async move {
+                    let _ = manager
+                        .request_addr(
+                            &addr,
+                            RpcRequest::WriteBlock {
+                                block_id,
+                                version,
+                                checksum,
+                                data,
+                            },
+                        )
+                        .await
+                        .map_err(|e| {
+                            eprintln!(
+                                "read-repair failed for block {} on node {}: {}",
+                                block_id, node_id, e
+                            )
+                        });
+                });
+            }
+        }
+
+        Ok(newest.data.clone())
+    }
+
+    pub async fn write_block_to_nodes(
+        &self,
+        nodes: &[StorageNode],
+        block_id: u64,
+        version: u64,
+        checksum: &str,
+        data: &[u8],
+    ) -> Result<Vec<ReplicaVersion>, DfsError> {
+        if nodes.is_empty() {
+            return Err(DfsError::Network(
+                "no storage nodes available for write".to_string(),
+            ));
+        }
+
+        let mut tasks = Vec::with_capacity(nodes.len());
+        for node in nodes {
+            let manager = self.clone();
+            let addr = node.addr.clone();
+            let node_id = node.id.clone();
+            let checksum = checksum.to_string();
+            let payload = data.to_vec();
+            tasks.push(tokio::spawn(async move {
+                let response = manager
+                    .request_addr(
+                        &addr,
+                        RpcRequest::WriteBlock {
+                            block_id,
+                            version,
+                            checksum,
+                            data: payload,
+                        },
+                    )
+                    .await;
+                (node_id, response)
+            }));
+        }
+
+        let mut acks = Vec::new();
+        let mut errors = Vec::new();
+        for task in tasks {
+            match task.await {
+                Ok((_, Ok(RpcResponse::WriteAck { replica }))) => acks.push(replica),
+                Ok((node_id, Ok(RpcResponse::Error { error }))) => {
+                    errors.push(format!("{}: {}", node_id, error.message))
+                }
+                Ok((node_id, Ok(other))) => {
+                    errors.push(format!("{}: unexpected response {:?}", node_id, other))
+                }
+                Ok((node_id, Err(e))) => errors.push(format!("{}: {}", node_id, e)),
+                Err(e) => errors.push(format!("task join error: {}", e)),
+            }
+        }
+
+        let required = nodes.len().div_ceil(2);
+        if acks.len() < required {
+            return Err(DfsError::Network(format!(
+                "insufficient write acknowledgements ({}/{}): {:?}",
+                acks.len(),
+                required,
+                errors
+            )));
+        }
+
+        Ok(acks)
+    }
+
+    pub async fn get_stats(&self) -> ConnectionStatsSnapshot {
+        let stats = self.stats.read().await;
+        ConnectionStatsSnapshot {
+            total_requests: stats.total_requests,
+            failed_requests: stats.failed_requests,
+            bytes_sent: stats.bytes_sent,
+            bytes_received: stats.bytes_received,
+            last_error: stats.last_error.clone(),
+        }
+    }
+
+    async fn request_master(&self, payload: RpcRequest) -> Result<RpcResponse, DfsError> {
+        self.request_addr(&self.master_addr, payload).await
+    }
+
+    async fn request_addr(&self, addr: &str, payload: RpcRequest) -> Result<RpcResponse, DfsError> {
+        let mut last_err = None;
+
+        let approx_size = estimate_payload_size(&payload);
+
+        for attempt in 1..=RETRY_ATTEMPTS {
+            match timeout(CONNECTION_TIMEOUT, TcpStream::connect(addr)).await {
+                Ok(Ok(mut stream)) => {
+                    let request_id = self.request_id.fetch_add(1, Ordering::SeqCst);
+                    let envelope = RpcEnvelope {
+                        version: PROTOCOL_VERSION,
+                        request_id,
+                        token: auth_token(),
+                        payload: payload.clone(),
+                    };
+
+                    if let Err(e) = send_envelope(&mut stream, &envelope).await {
+                        last_err = Some(DfsError::Io(e));
+                    } else {
+                        match recv_response(&mut stream).await {
+                            Ok(response) => {
+                                let mut stats = self.stats.write().await;
+                                stats.total_requests += 1;
+                                stats.bytes_sent += approx_size as u64;
+                                stats.bytes_received += estimate_response_size(&response) as u64;
+                                return Ok(response);
+                            }
+                            Err(e) => {
+                                last_err = Some(DfsError::Io(e));
+                            }
+                        }
+                    }
+                }
+                Ok(Err(e)) => {
+                    last_err = Some(DfsError::Network(format!(
+                        "failed to connect to {}: {}",
+                        addr, e
+                    )));
+                }
+                Err(_) => {
+                    last_err = Some(DfsError::Network(format!("connection timeout to {}", addr)));
+                }
+            }
+
+            if attempt < RETRY_ATTEMPTS {
+                sleep(RETRY_BACKOFF * attempt).await;
+            }
+        }
+
+        let error =
+            last_err.unwrap_or_else(|| DfsError::Network("unknown request failure".to_string()));
+        let mut stats = self.stats.write().await;
+        stats.total_requests += 1;
+        stats.failed_requests += 1;
+        stats.last_error = Some(error.to_string());
+        Err(error)
+    }
+
+    fn expect_ok(&self, response: RpcResponse) -> Result<(), DfsError> {
+        match response {
+            RpcResponse::Ok => Ok(()),
+            RpcResponse::Error { error } => Err(error.into()),
+            _ => Err(DfsError::Protocol("unexpected response".to_string())),
+        }
+    }
+}
+
+fn estimate_payload_size(payload: &RpcRequest) -> usize {
+    serde_json::to_vec(payload).map(|v| v.len()).unwrap_or(0)
+}
+
+fn estimate_response_size(response: &RpcResponse) -> usize {
+    serde_json::to_vec(response).map(|v| v.len()).unwrap_or(0)
 }

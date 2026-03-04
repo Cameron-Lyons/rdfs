@@ -1,162 +1,90 @@
-use crate::client::connection::{Envelope, Request, Response, auth_token};
-use crate::server::metadata::{MetadataStore, NodeInfo};
+use crate::protocol::{
+    PROTOCOL_VERSION, RpcEnvelope, RpcRequest, RpcResponse, StorageNode, auth_token, recv_response,
+    send_envelope,
+};
+use crate::server::metadata::MetadataStore;
 use std::collections::HashSet;
 use std::sync::Arc;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 pub struct ReplicationManager {
     metadata_store: Arc<MetadataStore>,
-    replication_factor: usize,
+    default_replication_factor: usize,
 }
 
 impl ReplicationManager {
-    pub fn new(metadata_store: Arc<MetadataStore>, replication_factor: usize) -> Self {
+    pub fn new(metadata_store: Arc<MetadataStore>, default_replication_factor: usize) -> Self {
         Self {
             metadata_store,
-            replication_factor,
+            default_replication_factor,
         }
     }
 
-    pub async fn replicate_block(
-        &self,
-        file_path: &str,
-        block_id: u64,
-        data: &[u8],
-    ) -> Result<Vec<String>, String> {
-        let nodes = self
+    pub async fn ensure_replication(&self, file_id: u64) -> Result<(), String> {
+        let layout = self
             .metadata_store
-            .select_nodes_for_replication(self.replication_factor)
-            .await;
-
-        if nodes.len() < self.replication_factor {
-            return Err(format!(
-                "Not enough nodes for replication. Required: {}, Available: {}",
-                self.replication_factor,
-                nodes.len()
-            ));
-        }
-
-        let mut successful_replicas = Vec::new();
-        let mut tasks = Vec::new();
-
-        for node in nodes {
-            let data_clone = data.to_vec();
-            let node_clone = node.clone();
-            let file_path_clone = file_path.to_string();
-            let metadata_store = Arc::clone(&self.metadata_store);
-
-            let task = tokio::spawn(async move {
-                if write_to_node(&node_clone, block_id, &data_clone)
-                    .await
-                    .is_ok()
-                {
-                    metadata_store
-                        .update_block_replicas(&file_path_clone, block_id, node_clone.id.clone())
-                        .await;
-                    Ok(node_clone.id)
-                } else {
-                    Err(format!("Failed to replicate to node {}", node_clone.id))
-                }
-            });
-
-            tasks.push(task);
-        }
-
-        for task in tasks {
-            if let Ok(Ok(node_id)) = task.await {
-                successful_replicas.push(node_id);
-            }
-        }
-
-        if successful_replicas.len() > self.replication_factor / 2 {
-            Ok(successful_replicas)
-        } else {
-            Err(format!(
-                "Insufficient successful replicas. Required: {}, Successful: {}",
-                self.replication_factor / 2 + 1,
-                successful_replicas.len()
-            ))
-        }
-    }
-
-    pub async fn ensure_replication(&self, file_path: &str) -> Result<(), String> {
-        let file_info = self
-            .metadata_store
-            .get_file(file_path)
+            .get_file_layout(file_id)
             .await
-            .ok_or_else(|| format!("File {} not found", file_path))?;
+            .map_err(|e| e.to_string())?;
 
-        for block in &file_info.blocks {
-            let replica_count = block.replicas.len();
+        let replication_factor = if layout.handle.replication_factor == 0 {
+            self.default_replication_factor
+        } else {
+            layout.handle.replication_factor
+        };
 
-            if replica_count < self.replication_factor {
-                let needed = self.replication_factor - replica_count;
-                let available_nodes = self.metadata_store.get_active_nodes().await;
+        for block in layout.blocks {
+            if block.replicas.len() >= replication_factor {
+                continue;
+            }
 
-                let existing_node_ids: HashSet<&str> =
-                    block.replicas.iter().map(|r| r.node_id.as_str()).collect();
+            let source = block
+                .replicas
+                .iter()
+                .max_by_key(|replica| replica.version)
+                .cloned();
+            let Some(source_replica) = source else {
+                continue;
+            };
 
-                let new_nodes: Vec<NodeInfo> = available_nodes
-                    .into_iter()
-                    .filter(|n| !existing_node_ids.contains(n.id.as_str()))
-                    .take(needed)
-                    .collect();
+            let source_data = read_from_node(&source_replica.addr, block.block_id).await?;
+            let existing_nodes: HashSet<String> =
+                block.replicas.iter().map(|r| r.node_id.clone()).collect();
+            let needed = replication_factor.saturating_sub(block.replicas.len());
 
-                if new_nodes.len() < needed {
-                    eprintln!(
-                        "Warning: Cannot achieve replication factor {} for block {}",
-                        self.replication_factor, block.block_id
-                    );
-                    self.metadata_store
-                        .mark_block_under_replicated(block.block_id)
-                        .await;
-                    continue;
-                }
+            let targets = self
+                .metadata_store
+                .select_nodes_for_replication_excluding(needed, &existing_nodes)
+                .await;
 
-                if let Some(source_replica) = block.replicas.first() {
-                    let source_addr = self
-                        .metadata_store
-                        .get_node(&source_replica.node_id)
-                        .await
-                        .map(|n| n.addr.clone())
-                        .ok_or_else(|| {
-                            format!("Source node {} not found", source_replica.node_id)
-                        })?;
+            for target in targets {
+                let node = StorageNode {
+                    id: target.id.clone(),
+                    addr: target.addr.clone(),
+                };
 
-                    if let Ok(data) = read_from_node(&source_addr, block.block_id).await {
-                        let mut added = 0usize;
-                        for node in new_nodes {
-                            if write_to_node(&node, block.block_id, &data).await.is_ok() {
-                                self.metadata_store
-                                    .update_block_replicas(file_path, block.block_id, node.id)
-                                    .await;
-                                added += 1;
-                            }
-                        }
-                        if replica_count + added >= self.replication_factor {
-                            self.metadata_store
-                                .clear_block_under_replicated(block.block_id)
-                                .await;
-                        } else {
-                            self.metadata_store
-                                .mark_block_under_replicated(block.block_id)
-                                .await;
-                        }
-                    } else {
-                        self.metadata_store
-                            .mark_block_under_replicated(block.block_id)
+                match write_to_node(
+                    &node,
+                    block.block_id,
+                    source_data.version,
+                    &source_data.checksum,
+                    &source_data.data,
+                )
+                .await
+                {
+                    Ok(version) => {
+                        let _ = self
+                            .metadata_store
+                            .add_block_replica(file_id, block.block_id, target.id, version)
                             .await;
                     }
-                } else {
-                    self.metadata_store
-                        .mark_block_under_replicated(block.block_id)
-                        .await;
+                    Err(e) => {
+                        eprintln!(
+                            "Replication write failed for block {} to {}: {}",
+                            block.block_id, node.addr, e
+                        );
+                    }
                 }
-            } else {
-                self.metadata_store
-                    .clear_block_under_replicated(block.block_id)
-                    .await;
             }
         }
 
@@ -164,18 +92,15 @@ impl ReplicationManager {
     }
 
     pub async fn handle_node_failure(&self, failed_node_id: &str) -> Result<(), String> {
-        println!("Handling failure of node: {}", failed_node_id);
-
         self.metadata_store.mark_node_failed(failed_node_id).await;
         self.metadata_store
             .remove_node_replicas(failed_node_id)
             .await;
 
-        let file_paths = self.metadata_store.get_all_file_paths().await;
-
-        for path in file_paths {
-            if let Err(e) = self.ensure_replication(&path).await {
-                eprintln!("Re-replication failed for {}: {}", path, e);
+        let file_ids = self.metadata_store.all_file_ids().await;
+        for file_id in file_ids {
+            if let Err(e) = self.ensure_replication(file_id).await {
+                eprintln!("Replication check failed for file_id={file_id}: {e}");
             }
         }
 
@@ -183,83 +108,77 @@ impl ReplicationManager {
     }
 }
 
-async fn write_to_node(node: &NodeInfo, block_id: u64, data: &[u8]) -> Result<(), String> {
-    let mut stream = TcpStream::connect(&node.addr)
+struct ReadResult {
+    data: Vec<u8>,
+    checksum: String,
+    version: u64,
+}
+
+async fn read_from_node(node_addr: &str, block_id: u64) -> Result<ReadResult, String> {
+    let mut stream = TcpStream::connect(node_addr)
         .await
-        .map_err(|e| format!("Failed to connect to {}: {}", node.addr, e))?;
+        .map_err(|e| format!("failed to connect to {node_addr}: {e}"))?;
 
-    let request = Request::WriteBlock {
-        block_id,
-        data: data.to_vec(),
-    };
-
-    let envelope = Envelope {
+    let envelope = RpcEnvelope {
+        version: PROTOCOL_VERSION,
+        request_id: 0,
         token: auth_token(),
-        payload: request,
+        payload: RpcRequest::ReadBlock { block_id },
     };
 
-    let msg = serde_json::to_vec(&envelope).map_err(|e| e.to_string())?;
-    let len = (msg.len() as u32).to_be_bytes();
-
-    stream.write_all(&len).await.map_err(|e| e.to_string())?;
-    stream.write_all(&msg).await.map_err(|e| e.to_string())?;
-
-    let mut len_buf = [0u8; 4];
-    stream
-        .read_exact(&mut len_buf)
+    send_envelope(&mut stream, &envelope)
         .await
-        .map_err(|e| e.to_string())?;
-    let len = u32::from_be_bytes(len_buf) as usize;
+        .map_err(|e| format!("failed to send read request: {e}"))?;
 
-    let mut buf = vec![0u8; len];
-    stream
-        .read_exact(&mut buf)
+    let response = recv_response(&mut stream)
         .await
-        .map_err(|e| e.to_string())?;
-
-    let response: Response = serde_json::from_slice(&buf).map_err(|e| e.to_string())?;
+        .map_err(|e| format!("failed to receive read response: {e}"))?;
 
     match response {
-        Response::Ok => Ok(()),
-        Response::Error { message } => Err(message),
-        _ => Err("Unexpected response".to_string()),
+        RpcResponse::BlockPayload { block } => Ok(ReadResult {
+            data: block.data,
+            checksum: block.checksum,
+            version: block.version,
+        }),
+        RpcResponse::Error { error } => Err(error.message),
+        _ => Err("unexpected response while reading block".to_string()),
     }
 }
 
-async fn read_from_node(node_addr: &str, block_id: u64) -> Result<Vec<u8>, String> {
-    let mut stream = TcpStream::connect(node_addr)
+async fn write_to_node(
+    node: &StorageNode,
+    block_id: u64,
+    version: u64,
+    checksum: &str,
+    data: &[u8],
+) -> Result<u64, String> {
+    let mut stream = TcpStream::connect(&node.addr)
         .await
-        .map_err(|e| format!("Failed to connect: {}", e))?;
+        .map_err(|e| format!("failed to connect to {}: {}", node.addr, e))?;
 
-    let request = Request::ReadBlock { block_id };
-    let envelope = Envelope {
+    let envelope = RpcEnvelope {
+        version: PROTOCOL_VERSION,
+        request_id: 0,
         token: auth_token(),
-        payload: request,
+        payload: RpcRequest::WriteBlock {
+            block_id,
+            version,
+            checksum: checksum.to_string(),
+            data: data.to_vec(),
+        },
     };
-    let msg = serde_json::to_vec(&envelope).map_err(|e| e.to_string())?;
-    let len = (msg.len() as u32).to_be_bytes();
 
-    stream.write_all(&len).await.map_err(|e| e.to_string())?;
-    stream.write_all(&msg).await.map_err(|e| e.to_string())?;
-
-    let mut len_buf = [0u8; 4];
-    stream
-        .read_exact(&mut len_buf)
+    send_envelope(&mut stream, &envelope)
         .await
-        .map_err(|e| e.to_string())?;
-    let len = u32::from_be_bytes(len_buf) as usize;
+        .map_err(|e| format!("failed to send write request: {e}"))?;
 
-    let mut buf = vec![0u8; len];
-    stream
-        .read_exact(&mut buf)
+    let response = recv_response(&mut stream)
         .await
-        .map_err(|e| e.to_string())?;
-
-    let response: Response = serde_json::from_slice(&buf).map_err(|e| e.to_string())?;
+        .map_err(|e| format!("failed to receive write response: {e}"))?;
 
     match response {
-        Response::BlockData { data } => Ok(data),
-        Response::Error { message } => Err(message),
-        _ => Err("Unexpected response".to_string()),
+        RpcResponse::WriteAck { replica } => Ok(replica.version),
+        RpcResponse::Error { error } => Err(error.message),
+        _ => Err("unexpected response while writing block".to_string()),
     }
 }

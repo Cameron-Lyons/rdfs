@@ -1,130 +1,153 @@
-use crate::client::{
-    connection::{ConnectionManager, FileMetadata},
-    error::DfsError,
-};
+use crate::checksum::checksum_hex;
+use crate::client::{connection::ConnectionManager, error::DfsError};
+use crate::protocol::{FileHandle, WriteSessionInfo};
+use std::sync::Arc;
+use tokio::sync::RwLock;
 
 #[derive(Clone)]
 pub struct DfsFile {
-    path: String,
-    metadata: FileMetadata,
+    handle: Arc<RwLock<FileHandle>>,
     conn: ConnectionManager,
 }
 
 impl DfsFile {
-    pub fn new(path: String, metadata: FileMetadata, conn: ConnectionManager) -> Self {
+    pub fn new(handle: FileHandle, conn: ConnectionManager) -> Self {
         Self {
-            path,
-            metadata,
+            handle: Arc::new(RwLock::new(handle)),
             conn,
         }
     }
 
+    pub async fn get_generation(&self) -> u64 {
+        self.handle.read().await.generation
+    }
+
     pub async fn read_block(&self, block_id: u64) -> Result<Vec<u8>, DfsError> {
-        self.conn.read_block(&self.metadata, block_id).await
-    }
+        let (file_id, generation) = {
+            let handle = self.handle.read().await;
+            (handle.file_id, handle.generation)
+        };
 
-    pub async fn write_block(&self, block_id: u64, data: &[u8]) -> Result<(), DfsError> {
-        self.conn.write_block(&self.metadata, block_id, data).await
-    }
+        let layout = self.conn.get_file_layout(file_id, Some(generation)).await?;
 
-    pub fn get_path(&self) -> &str {
-        &self.path
-    }
-
-    pub fn get_size(&self) -> u64 {
-        self.metadata.size
-    }
-
-    pub fn get_block_count(&self) -> usize {
-        self.metadata.blocks.len()
-    }
-
-    pub fn get_replica_count(&self) -> usize {
-        self.metadata.nodes.len()
-    }
-
-    pub fn get_metadata(&self) -> &FileMetadata {
-        &self.metadata
-    }
-
-    pub async fn write_blocks(&self, blocks: Vec<(u64, &[u8])>) -> Result<(), DfsError> {
-        let mut results = Vec::new();
-
-        for (block_id, data) in blocks {
-            results.push(self.write_block(block_id, data).await);
+        {
+            let mut handle = self.handle.write().await;
+            *handle = layout.handle.clone();
         }
 
-        for result in results {
-            result?;
+        self.conn.read_block(&layout, block_id).await
+    }
+
+    pub async fn read_all(&self) -> Result<Vec<u8>, DfsError> {
+        let (file_id, generation) = {
+            let handle = self.handle.read().await;
+            (handle.file_id, handle.generation)
+        };
+
+        let layout = self.conn.get_file_layout(file_id, Some(generation)).await?;
+
+        {
+            let mut handle = self.handle.write().await;
+            *handle = layout.handle.clone();
         }
 
+        let mut result = Vec::with_capacity(layout.size as usize);
+        for block in &layout.blocks {
+            let data = self.conn.read_block(&layout, block.block_id).await?;
+            result.extend_from_slice(&data);
+        }
+
+        Ok(result)
+    }
+
+    pub async fn begin_write(&self) -> Result<DfsWriteSession, DfsError> {
+        let (file_id, generation) = {
+            let handle = self.handle.read().await;
+            (handle.file_id, handle.generation)
+        };
+
+        let session = match self.conn.begin_write(file_id, generation).await {
+            Ok(session) => session,
+            Err(err) if err.is_stale_handle() => {
+                if let Some(handle) = err.current_handle() {
+                    {
+                        let mut guard = self.handle.write().await;
+                        *guard = handle.clone();
+                    }
+                    self.conn
+                        .begin_write(handle.file_id, handle.generation)
+                        .await?
+                } else {
+                    return Err(err);
+                }
+            }
+            Err(err) => return Err(err),
+        };
+
+        Ok(DfsWriteSession {
+            conn: self.conn.clone(),
+            file_handle: Arc::clone(&self.handle),
+            session,
+        })
+    }
+
+    pub async fn write_all(&self, data: &[u8], chunk_size: usize) -> Result<(), DfsError> {
+        if chunk_size == 0 {
+            return Err(DfsError::Protocol(
+                "chunk_size must be greater than 0".to_string(),
+            ));
+        }
+
+        let mut session = self.begin_write().await?;
+        for chunk in data.chunks(chunk_size) {
+            session.write_chunk(chunk).await?;
+        }
+        session.commit().await
+    }
+}
+
+pub struct DfsWriteSession {
+    conn: ConnectionManager,
+    file_handle: Arc<RwLock<FileHandle>>,
+    session: WriteSessionInfo,
+}
+
+impl DfsWriteSession {
+    pub async fn write_chunk(&mut self, data: &[u8]) -> Result<(), DfsError> {
+        let checksum = checksum_hex(data);
+        let (block_id, nodes) = self
+            .conn
+            .allocate_write_chunk(self.session.session_id, data.len() as u64, checksum.clone())
+            .await?;
+
+        let replicas = self
+            .conn
+            .write_block_to_nodes(
+                &nodes,
+                block_id,
+                self.session.target_generation,
+                &checksum,
+                data,
+            )
+            .await?;
+
+        self.conn
+            .finalize_write_chunk(self.session.session_id, block_id, replicas)
+            .await?;
         Ok(())
     }
 
-    pub async fn read_blocks(&self, block_ids: Vec<u64>) -> Result<Vec<Vec<u8>>, DfsError> {
-        let mut blocks = Vec::new();
-
-        for block_id in block_ids {
-            blocks.push(self.read_block(block_id).await?);
+    pub async fn commit(self) -> Result<(), DfsError> {
+        let handle = self.conn.commit_write(self.session.session_id).await?;
+        {
+            let mut guard = self.file_handle.write().await;
+            *guard = handle;
         }
-
-        Ok(blocks)
+        Ok(())
     }
 
-    pub fn stream_read(&self) -> DfsFileStream {
-        DfsFileStream::new(self.clone())
-    }
-
-    pub fn stream_write(&self) -> DfsFileWriter {
-        DfsFileWriter::new(self.clone())
-    }
-}
-
-pub struct DfsFileStream {
-    file: DfsFile,
-    current_block: u64,
-    total_blocks: u64,
-}
-
-impl DfsFileStream {
-    fn new(file: DfsFile) -> Self {
-        let total_blocks = file.get_block_count() as u64;
-        Self {
-            file,
-            current_block: 0,
-            total_blocks,
-        }
-    }
-
-    pub async fn next(&mut self) -> Option<Result<Vec<u8>, DfsError>> {
-        if self.current_block >= self.total_blocks {
-            return None;
-        }
-
-        let result = self.file.read_block(self.current_block).await;
-        self.current_block += 1;
-        Some(result)
-    }
-}
-
-pub struct DfsFileWriter {
-    file: DfsFile,
-    current_block: u64,
-}
-
-impl DfsFileWriter {
-    fn new(file: DfsFile) -> Self {
-        Self {
-            file,
-            current_block: 0,
-        }
-    }
-
-    pub async fn write_chunk(&mut self, data: &[u8]) -> Result<(), DfsError> {
-        let result = self.file.write_block(self.current_block, data).await;
-        if result.is_ok() {
-            self.current_block += 1;
-        }
-        result
+    pub async fn abort(self) -> Result<(), DfsError> {
+        self.conn.abort_write(self.session.session_id).await?;
+        Ok(())
     }
 }

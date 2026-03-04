@@ -1,8 +1,9 @@
 use crate::client::{
-    connection::{ConnectionManager, ConnectionStatsSnapshot, FileInfo},
+    connection::{ConnectionManager, ConnectionStatsSnapshot},
     error::DfsError,
     file::DfsFile,
 };
+use crate::protocol::DirectoryEntry;
 
 #[derive(Clone)]
 pub struct DfsClient {
@@ -15,30 +16,12 @@ impl DfsClient {
         Ok(Self { conn })
     }
 
+    pub async fn mkdir(&self, path: &str) -> Result<(), DfsError> {
+        self.conn.create_directory(path).await
+    }
+
     pub async fn create(&self, path: &str) -> Result<DfsFile, DfsError> {
-        let metadata = self.conn.create_file(path).await?;
-        Ok(DfsFile::new(path.to_string(), metadata, self.conn.clone()))
-    }
-
-    pub async fn open(&self, path: &str) -> Result<DfsFile, DfsError> {
-        let metadata = self.conn.lookup_metadata(path).await?;
-        Ok(DfsFile::new(path.to_string(), metadata, self.conn.clone()))
-    }
-
-    pub async fn list(&self, path: &str) -> Result<Vec<FileInfo>, DfsError> {
-        self.conn.list_files(path).await
-    }
-
-    pub async fn rename(&self, from: &str, to: &str) -> Result<(), DfsError> {
-        self.conn.rename_file(from, to).await
-    }
-
-    pub async fn delete(&self, path: &str) -> Result<(), DfsError> {
-        self.conn.delete_file(path).await
-    }
-
-    pub async fn get_connection_stats(&self) -> ConnectionStatsSnapshot {
-        self.conn.get_stats().await
+        self.create_with_replication(path, 3).await
     }
 
     pub async fn create_with_replication(
@@ -46,10 +29,24 @@ impl DfsClient {
         path: &str,
         replication_factor: usize,
     ) -> Result<DfsFile, DfsError> {
-        let metadata = self
-            .conn
-            .create_file_with_replication(path, replication_factor)
-            .await?;
-        Ok(DfsFile::new(path.to_string(), metadata, self.conn.clone()))
+        let handle = self.conn.create_file(path, replication_factor).await?;
+        Ok(DfsFile::new(handle, self.conn.clone()))
+    }
+
+    pub async fn open(&self, path: &str) -> Result<DfsFile, DfsError> {
+        let handle = self.conn.resolve_path(path).await?;
+        Ok(DfsFile::new(handle, self.conn.clone()))
+    }
+
+    pub async fn list(&self, path: &str) -> Result<Vec<DirectoryEntry>, DfsError> {
+        self.conn.list_directory(path).await
+    }
+
+    pub async fn rename(&self, from: &str, to: &str) -> Result<(), DfsError> {
+        self.conn.rename_entry(from, to).await
+    }
+
+    pub async fn get_connection_stats(&self) -> ConnectionStatsSnapshot {
+        self.conn.get_stats().await
     }
 }
