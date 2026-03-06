@@ -1,1 +1,5 @@
 /target
+/data
+/rdfs_metadata_*.db
+/rdfs_metadata_*.db-shm
+/rdfs_metadata_*.db-wal

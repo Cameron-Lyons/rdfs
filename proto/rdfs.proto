@@ -1,0 +1,274 @@
+syntax = "proto3";
+
+package rdfs.v3;
+
+message Empty {}
+
+message FileInfo {
+  uint64 inode = 1;
+  string path = 2;
+  uint64 version = 3;
+  uint64 size = 4;
+  uint32 chunk_size = 5;
+  bool is_dir = 6;
+}
+
+message ChunkReplica {
+  string node_id = 1;
+  string addr = 2;
+  uint64 version = 3;
+}
+
+message ChunkRef {
+  string chunk_id = 1;
+  uint64 offset = 2;
+  uint64 size = 3;
+  string checksum = 4;
+  repeated ChunkReplica replicas = 5;
+}
+
+message FileManifest {
+  FileInfo info = 1;
+  repeated ChunkRef chunks = 2;
+}
+
+message DirectoryEntry {
+  string path = 1;
+  string name = 2;
+  bool is_dir = 3;
+  uint64 size = 4;
+  uint64 version = 5;
+}
+
+enum UploadMode {
+  UPLOAD_MODE_UNSPECIFIED = 0;
+  UPLOAD_MODE_CREATE = 1;
+  UPLOAD_MODE_OVERWRITE = 2;
+}
+
+message UploadSession {
+  string upload_id = 1;
+  uint64 lease_expiry_unix_ms = 2;
+  uint64 target_version = 3;
+  uint32 chunk_size = 4;
+  uint32 replication_factor = 5;
+}
+
+message ChunkPlacement {
+  string chunk_id = 1;
+  uint64 version = 2;
+  repeated ChunkReplica replicas = 3;
+}
+
+message CommitChunk {
+  string chunk_id = 1;
+  uint64 offset = 2;
+  uint64 size = 3;
+  string checksum = 4;
+  repeated ChunkReplica replicas = 5;
+}
+
+message InventoryChunk {
+  string chunk_id = 1;
+  uint64 version = 2;
+  string checksum = 3;
+  uint64 size = 4;
+}
+
+message StatRequest {
+  string path = 1;
+}
+
+message ListRequest {
+  string path = 1;
+}
+
+message ListResponse {
+  repeated DirectoryEntry entries = 1;
+}
+
+message MkdirRequest {
+  string path = 1;
+}
+
+message RenameRequest {
+  string from = 1;
+  string to = 2;
+}
+
+message DeleteRequest {
+  string path = 1;
+}
+
+message OpenFileRequest {
+  string path = 1;
+}
+
+message BeginUploadRequest {
+  string path = 1;
+  UploadMode mode = 2;
+  uint32 replication_factor = 3;
+  uint32 chunk_size = 4;
+}
+
+message AllocateChunkRequest {
+  string upload_id = 1;
+  uint64 size = 2;
+  string checksum = 3;
+}
+
+message CommitUploadRequest {
+  string upload_id = 1;
+  repeated CommitChunk chunks = 2;
+}
+
+message AbortUploadRequest {
+  string upload_id = 1;
+}
+
+message ReportReplicaFailureRequest {
+  string chunk_id = 1;
+  string node_id = 2;
+  string reason = 3;
+}
+
+message HeartbeatRequest {
+  string node_id = 1;
+  string addr = 2;
+  uint64 capacity = 3;
+  uint64 used = 4;
+  repeated InventoryChunk inventory = 5;
+}
+
+message MetadataNodeInfo {
+  uint64 id = 1;
+  string addr = 2;
+  bool voter = 3;
+}
+
+message ClusterMembership {
+  repeated MetadataNodeInfo nodes = 1;
+  bool joint = 2;
+}
+
+message AddMetadataNodeRequest {
+  uint64 node_id = 1;
+  string addr = 2;
+  bool promote_to_voter = 3;
+}
+
+message RemoveMetadataNodeRequest {
+  uint64 node_id = 1;
+  bool retain_as_learner = 2;
+}
+
+message ReplaceMetadataNodeRequest {
+  uint64 old_node_id = 1;
+  uint64 new_node_id = 2;
+  string new_addr = 3;
+}
+
+message PutChunkHeader {
+  string chunk_id = 1;
+  uint64 version = 2;
+  string checksum = 3;
+  uint64 size = 4;
+  repeated ChunkReplica forward_targets = 5;
+}
+
+message PutChunkRequest {
+  oneof item {
+    PutChunkHeader header = 1;
+    bytes data = 2;
+  }
+}
+
+message ChunkMetadata {
+  string chunk_id = 1;
+  uint64 version = 2;
+  string checksum = 3;
+  uint64 size = 4;
+  string node_id = 5;
+}
+
+message PutChunkResponse {
+  ChunkReplica replica = 1;
+}
+
+message ReplicateChunkRequest {
+  string chunk_id = 1;
+  uint64 version = 2;
+  string checksum = 3;
+  bytes data = 4;
+}
+
+message GetChunkRequest {
+  string chunk_id = 1;
+  uint64 version = 2;
+}
+
+message GetChunkResponse {
+  oneof item {
+    ChunkMetadata metadata = 1;
+    bytes data = 2;
+  }
+}
+
+message DeleteChunkRequest {
+  string chunk_id = 1;
+  uint64 version = 2;
+}
+
+message ReportInventoryRequest {
+  bool include_chunks = 1;
+}
+
+message ReportInventoryResponse {
+  string node_id = 1;
+  uint64 capacity = 2;
+  uint64 used = 3;
+  repeated InventoryChunk inventory = 4;
+}
+
+message JsonEnvelope {
+  bytes json = 1;
+}
+
+message InstallSnapshotRequest {
+  bytes vote_json = 1;
+  bytes meta_json = 2;
+  bytes snapshot = 3;
+}
+
+service MetadataService {
+  rpc Stat(StatRequest) returns (FileInfo);
+  rpc List(ListRequest) returns (ListResponse);
+  rpc Mkdir(MkdirRequest) returns (FileInfo);
+  rpc Rename(RenameRequest) returns (Empty);
+  rpc Delete(DeleteRequest) returns (Empty);
+  rpc OpenFile(OpenFileRequest) returns (FileManifest);
+  rpc BeginUpload(BeginUploadRequest) returns (UploadSession);
+  rpc AllocateChunk(AllocateChunkRequest) returns (ChunkPlacement);
+  rpc CommitUpload(CommitUploadRequest) returns (FileManifest);
+  rpc AbortUpload(AbortUploadRequest) returns (Empty);
+  rpc ReportReplicaFailure(ReportReplicaFailureRequest) returns (Empty);
+  rpc Heartbeat(HeartbeatRequest) returns (Empty);
+  rpc GetClusterMembership(Empty) returns (ClusterMembership);
+  rpc AddMetadataNode(AddMetadataNodeRequest) returns (ClusterMembership);
+  rpc RemoveMetadataNode(RemoveMetadataNodeRequest) returns (ClusterMembership);
+  rpc ReplaceMetadataNode(ReplaceMetadataNodeRequest) returns (ClusterMembership);
+}
+
+service ChunkService {
+  rpc PutChunk(stream PutChunkRequest) returns (PutChunkResponse);
+  rpc GetChunk(GetChunkRequest) returns (stream GetChunkResponse);
+  rpc ReplicateChunk(ReplicateChunkRequest) returns (PutChunkResponse);
+  rpc DeleteChunk(DeleteChunkRequest) returns (Empty);
+  rpc ReportInventory(ReportInventoryRequest) returns (ReportInventoryResponse);
+}
+
+service RaftService {
+  rpc AppendEntries(JsonEnvelope) returns (JsonEnvelope);
+  rpc Vote(JsonEnvelope) returns (JsonEnvelope);
+  rpc InstallSnapshot(InstallSnapshotRequest) returns (JsonEnvelope);
+}

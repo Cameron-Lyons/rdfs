@@ -1,293 +1,103 @@
-# RDFS - Rust Distributed File System
+# RDFS v3
 
-A high-performance distributed file system implementation in Rust featuring automatic replication, fault tolerance, and strong consistency guarantees.
+RDFS is now a gRPC-based distributed file store with Raft-backed metadata, immutable chunk replicas, and manifest-based atomic commits.
 
-## Recent Updates
-- Removed all code comments for cleaner codebase
-- Optimized connection pooling with circuit breaker pattern
-- Enhanced performance with block caching and compression
-- Comprehensive test suite with unit and integration tests
+This rewrite intentionally breaks compatibility with the previous JSON/TCP prototype. The old wire protocol, public client API, and checked-in metadata/block artifacts are not part of v3.
 
-## Overview
+## Components
 
-RDFS provides a scalable, fault-tolerant distributed storage solution with automatic data replication across multiple nodes. The system handles node failures gracefully and ensures data availability through configurable replication factors.
+- `rdfs-meta`: metadata node with the public `MetadataService` plus internal `RaftService`
+- `rdfs-chunk`: chunkserver with streamed chunk upload/download and replica forwarding
+- `rdfs-client`: CLI for `mkdir`, `ls`, `put`, `cat`, `rm`, `stat`, and `demo`
+- `rdfs-local` / `xtask`: 3-meta / 3-chunk local cluster harness
 
-## Architecture
+## Design
 
-### Core Components
+- Metadata uses `openraft` with RocksDB-backed log/state persistence.
+- The state machine stores the namespace, file manifests, upload leases, chunk refcounts, tombstones, repair intents, and chunkserver heartbeats.
+- Chunkservers store immutable chunk files on disk with a RocksDB index.
+- Writers upload chunks to a primary replica, which stores locally and forwards to secondaries before acknowledging.
+- `CommitUpload` atomically swaps the visible file manifest, so uncommitted uploads remain invisible.
+- Reads are leader-only in v1 and use leader-lease reads before serving metadata.
+- Readers report corrupt or unreadable chunk replicas back to metadata so the repair loop can restore replication.
+- Chunkserver heartbeats reconcile on-disk inventory back into metadata, so restarted replicas rejoin fresh manifests automatically.
+- Metadata membership can be changed online by adding learners, promoting voters, removing dead nodes, and replacing failed voters.
 
-**Master Server**
-- Centralized metadata management
-- File-to-block mapping coordination  
-- Storage node registry and health monitoring
-- Replication strategy orchestration
-- Load balancing across storage nodes
+## Client API
 
-**Storage Nodes**
-- Block-level data storage (4MB blocks)
-- Local filesystem persistence
-- Automatic heartbeat reporting
-- Concurrent request handling
-- Checksum verification
+The Rust client surface is now high-level:
 
-**Client Library**
-- Connection pooling and reuse
-- Automatic retry with exponential backoff
-- Parallel writes to replica nodes
-- Statistics tracking and monitoring
-- Streaming support for large files
+- `Client::create_writer(path, options)`
+- `Client::overwrite_writer(path, options)`
+- `Client::open_reader(path)`
+- `Client::stat/list/mkdir/rename/delete`
 
-### System Features
-
-- **Block-based Storage**: Efficient 4MB block size for optimal I/O
-- **Configurable Replication**: Default factor of 3 with majority quorum writes
-- **Automatic Failover**: Transparent replica selection on node failure
-- **Health Monitoring**: 10-second heartbeat intervals with 60-second timeout
-- **Connection Pooling**: Reusable TCP connections with automatic cleanup
-- **Retry Logic**: 3 attempts with exponential backoff
-- **Parallel Operations**: Concurrent reads/writes across replicas
-
-## Installation
-
-### Prerequisites
-- Rust 1.70+ 
-- Cargo build tool
-- Unix-like OS (Linux/macOS)
-
-### Building from Source
-
-```bash
-git clone https://github.com/yourusername/rdfs.git
-cd rdfs
-cargo build --release
-```
+There is no public per-block mutation API in v3.
 
 ## Quick Start
 
-### Demo Script
-
-Run the complete system with one command:
+Launch a local cluster:
 
 ```bash
-./demo.sh
+cargo run --bin rdfs-local
 ```
 
-This script:
-1. Builds the project
-2. Starts master server on port 9000
-3. Launches 3 storage nodes (ports 9001-9003)
-4. Runs client operations (`src/main.rs`)
-5. Cleanly shuts down all components
-
-### Manual Setup
-
-#### 1. Start Master Server
+Run the demo client:
 
 ```bash
-cargo run --release --bin master -- 127.0.0.1:9000
+cargo run --bin rdfs-client -- 127.0.0.1:9500,127.0.0.1:9501,127.0.0.1:9502 demo
 ```
 
-#### 2. Launch Storage Nodes
+Manual metadata startup:
 
 ```bash
-cargo run --release --bin storage -- node1 127.0.0.1:9001 127.0.0.1:9000 ./data/node1
-cargo run --release --bin storage -- node2 127.0.0.1:9002 127.0.0.1:9000 ./data/node2
-cargo run --release --bin storage -- node3 127.0.0.1:9003 127.0.0.1:9000 ./data/node3
+cargo run --bin rdfs-meta -- 1 127.0.0.1:9500 /tmp/rdfs/meta-1 1=127.0.0.1:9500,2=127.0.0.1:9501,3=127.0.0.1:9502 --bootstrap
+cargo run --bin rdfs-meta -- 2 127.0.0.1:9501 /tmp/rdfs/meta-2 1=127.0.0.1:9500,2=127.0.0.1:9501,3=127.0.0.1:9502
+cargo run --bin rdfs-meta -- 3 127.0.0.1:9502 /tmp/rdfs/meta-3 1=127.0.0.1:9500,2=127.0.0.1:9501,3=127.0.0.1:9502
 ```
 
-Parameters:
-- `node_id`: Unique identifier for the storage node
-- `listen_addr`: Address for incoming connections
-- `master_addr`: Master server connection endpoint
-- `data_dir`: Local directory for block storage
-
-#### 3. Run Client
+Manual chunkserver startup:
 
 ```bash
-cargo run --release --bin client_demo
+cargo run --bin rdfs-chunk -- chunk-1 127.0.0.1:9510 /tmp/rdfs/chunk-1 127.0.0.1:9500,127.0.0.1:9501,127.0.0.1:9502
+cargo run --bin rdfs-chunk -- chunk-2 127.0.0.1:9511 /tmp/rdfs/chunk-2 127.0.0.1:9500,127.0.0.1:9501,127.0.0.1:9502
+cargo run --bin rdfs-chunk -- chunk-3 127.0.0.1:9512 /tmp/rdfs/chunk-3 127.0.0.1:9500,127.0.0.1:9501,127.0.0.1:9502
 ```
 
-## API Usage
+CLI examples:
 
-### Basic Operations
-
-```rust
-use rdfs::client::api::DfsClient;
-
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Initialize client
-    let client = DfsClient::new("127.0.0.1:9000").await?;
-
-    // File operations
-    let file = client.open("/data/file.txt").await?;
-    
-    // Write data
-    file.write_block(0, b"Hello, RDFS!").await?;
-    
-    // Read data
-    let data = file.read_block(0).await?;
-    println!("Read: {}", String::from_utf8_lossy(&data));
-    
-    // List files
-    let files = client.list("/data").await?;
-    for file in files {
-        println!("{}: {} bytes", file.path, file.size);
-    }
-    
-    // Rename file
-    client.rename("/data/file.txt", "/data/renamed.txt").await?;
-    
-    // Delete file
-    client.delete("/data/renamed.txt").await?;
-    
-    // Get statistics
-    let stats = client.get_connection_stats().await;
-    println!("Total requests: {}", stats.total_requests);
-    
-    Ok(())
-}
-```
-
-### Advanced Features
-
-```rust
-// Custom replication factor
-let file = client.create_with_replication("/critical.dat", 5).await?;
-
-// Bulk operations
-let blocks = vec![
-    (0, b"Block 0 data"),
-    (1, b"Block 1 data"),
-    (2, b"Block 2 data"),
-];
-file.write_blocks(blocks).await?;
-
-// Streaming large files
-let mut stream = file.stream_read();
-while let Some(chunk) = stream.next().await {
-    process_chunk(chunk?);
-}
+```bash
+cargo run --bin rdfs-client -- 127.0.0.1:9500,127.0.0.1:9501,127.0.0.1:9502 mkdir /docs
+cargo run --bin rdfs-client -- 127.0.0.1:9500,127.0.0.1:9501,127.0.0.1:9502 put /docs/file.txt hello
+cargo run --bin rdfs-client -- 127.0.0.1:9500,127.0.0.1:9501,127.0.0.1:9502 cat /docs/file.txt
+cargo run --bin rdfs-client -- 127.0.0.1:9500,127.0.0.1:9501,127.0.0.1:9502 meta-membership
+cargo run --bin rdfs-client -- 127.0.0.1:9500,127.0.0.1:9501,127.0.0.1:9502 meta-add 4 127.0.0.1:9503 --voter
+cargo run --bin rdfs-client -- 127.0.0.1:9500,127.0.0.1:9501,127.0.0.1:9502 meta-replace 1 4 127.0.0.1:9503
 ```
 
 ## Testing
 
-### Unit Tests
-```bash
-cargo test --lib
-```
-
-### Integration Tests
-```bash
-cargo test --test integration_test
-```
-
-### Run All Tests
 ```bash
 cargo test
 ```
 
-### Stress Testing
-```bash
-cargo run --release --bin stress_test
-```
+Current test coverage includes:
 
-## Configuration
+- path normalization
+- atomic create/write/read/overwrite/delete on a 3-meta / 3-chunk cluster
+- invisibility of uncommitted uploads
+- single-writer lease enforcement
+- committed reads survive loss of one chunkserver
+- corrupt chunk replicas are detected on read and repaired in the background
+- fresh manifests drop dead replicas after failure reports and pick them back up after chunkserver restart heartbeats
+- uploads fail cleanly when a required chunk replica disappears before replication completes
+- metadata leader failover after a committed write
+- metadata voter replacement restoring quorum after losing a node
 
-### Master Server
-The master server accepts an optional address argument:
-```bash
-cargo run --release --bin master -- [ADDRESS]
-```
-- Default address: `127.0.0.1:9000`
-- Default replication factor: 3
-- Block size: 4MB
+## Not In Scope
 
-### Storage Node
-The storage node requires positional arguments:
-```bash
-cargo run --release --bin storage -- <node_id> <listen_addr> [master_addr] [data_dir]
-```
-- `node_id`: Unique identifier for the storage node (required)
-- `listen_addr`: Address for incoming connections (required)
-- `master_addr`: Master server address (default: `127.0.0.1:9000`)
-- `data_dir`: Local directory for block storage (default: `./data/<node_id>`)
-- Default capacity: 100GB
-- Heartbeat interval: 10 seconds
-
-### Client Configuration
-The client uses the following defaults:
-- Connection timeout: 5 seconds
-- Retry attempts: 3
-- Connection pool size: 10 per host
-- Circuit breaker threshold: 5 failures
-
-## Performance
-
-### Benchmarks
-
-| Operation | Throughput | Latency (p99) |
-|-----------|------------|---------------|
-| Write 4MB | 850 MB/s   | 12ms          |
-| Read 4MB  | 1.2 GB/s   | 8ms           |
-| List 1000 | 50k ops/s  | 2ms           |
-| Delete    | 100k ops/s | 1ms           |
-
-### Optimization Tips
-
-1. **Network**: Use high-bandwidth, low-latency connections
-2. **Storage**: SSDs recommended for storage nodes
-3. **Memory**: 8GB+ RAM for storage nodes
-4. **CPU**: Multi-core systems for parallel operations
-
-## Architecture Details
-
-### Data Flow
-
-```
-Client Request → Master Server → Metadata Lookup
-       ↓                              ↓
-Connection Pool              Storage Node Selection
-       ↓                              ↓
-Parallel Writes → Storage Nodes → Block Storage
-       ↓                              ↓
-Majority Ack ← Checksum Verify ← Write Complete
-```
-
-### Consistency Model
-
-- **Write Consistency**: Majority quorum (⌈n/2⌉ + 1)
-- **Read Consistency**: Single replica with failover
-- **Conflict Resolution**: Last-write-wins with versioning
-- **Failure Handling**: Automatic re-replication
-
-### Fault Tolerance
-
-1. **Node Failures**: Detected via heartbeat timeout
-2. **Network Partitions**: Handled with retry logic
-3. **Data Corruption**: Checksum verification
-4. **Recovery**: Automatic re-replication to maintain factor
-
-## Monitoring
-
-### Metrics Available
-
-- Request count and latency
-- Bytes transferred
-- Connection pool statistics  
-- Node health status
-- Replication lag
-- Storage utilization
-
-### Health Checks
-
-The health endpoint runs on port 9080 (master port + 80):
-```bash
-curl http://127.0.0.1:9080/health
-```
-
-The health endpoint returns JSON with system status, active nodes, and file counts.
-
-## License
-
-MIT License - see LICENSE file for details
+- POSIX/FUSE
+- append or random in-place writes
+- follower-served linearizable reads
+- metadata sharding
+- migration from the old prototype’s protocol or disk format
