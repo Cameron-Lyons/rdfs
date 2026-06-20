@@ -1378,7 +1378,7 @@ fn apply_rename(
         }
     }
 
-    moved.sort_by(|a, b| a.0.len().cmp(&b.0.len()));
+    moved.sort_by_key(|a| a.0.len());
     for (old_path, entry) in moved {
         let new_path = replace_prefix(&old_path, &from, &to);
         let new_entry = match entry {
