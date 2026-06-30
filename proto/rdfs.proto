@@ -1,13 +1,12 @@
 syntax = "proto3";
 
-package rdfs.v3;
+package rdfs;
 
 message Empty {}
 
 message FileInfo {
   uint64 inode = 1;
   string path = 2;
-  uint64 version = 3;
   uint64 size = 4;
   uint32 chunk_size = 5;
   bool is_dir = 6;
@@ -16,7 +15,6 @@ message FileInfo {
 message ChunkReplica {
   string node_id = 1;
   string addr = 2;
-  uint64 version = 3;
 }
 
 message ChunkRef {
@@ -37,7 +35,6 @@ message DirectoryEntry {
   string name = 2;
   bool is_dir = 3;
   uint64 size = 4;
-  uint64 version = 5;
 }
 
 enum UploadMode {
@@ -49,14 +46,12 @@ enum UploadMode {
 message UploadSession {
   string upload_id = 1;
   uint64 lease_expiry_unix_ms = 2;
-  uint64 target_version = 3;
   uint32 chunk_size = 4;
   uint32 replication_factor = 5;
 }
 
 message ChunkPlacement {
   string chunk_id = 1;
-  uint64 version = 2;
   repeated ChunkReplica replicas = 3;
 }
 
@@ -70,7 +65,6 @@ message CommitChunk {
 
 message InventoryChunk {
   string chunk_id = 1;
-  uint64 version = 2;
   string checksum = 3;
   uint64 size = 4;
 }
@@ -170,7 +164,6 @@ message ReplaceMetadataNodeRequest {
 
 message PutChunkHeader {
   string chunk_id = 1;
-  uint64 version = 2;
   string checksum = 3;
   uint64 size = 4;
   repeated ChunkReplica forward_targets = 5;
@@ -185,7 +178,6 @@ message PutChunkRequest {
 
 message ChunkMetadata {
   string chunk_id = 1;
-  uint64 version = 2;
   string checksum = 3;
   uint64 size = 4;
   string node_id = 5;
@@ -197,14 +189,12 @@ message PutChunkResponse {
 
 message ReplicateChunkRequest {
   string chunk_id = 1;
-  uint64 version = 2;
   string checksum = 3;
   bytes data = 4;
 }
 
 message GetChunkRequest {
   string chunk_id = 1;
-  uint64 version = 2;
 }
 
 message GetChunkResponse {
@@ -216,7 +206,6 @@ message GetChunkResponse {
 
 message DeleteChunkRequest {
   string chunk_id = 1;
-  uint64 version = 2;
 }
 
 message ReportInventoryRequest {

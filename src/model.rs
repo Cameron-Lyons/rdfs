@@ -27,7 +27,6 @@ impl TryFrom<i32> for UploadModeModel {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ReplicaPointer {
     pub node_id: String,
-    pub version: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -43,7 +42,6 @@ pub struct ChunkRefModel {
 pub struct FileInfoModel {
     pub inode: u64,
     pub path: String,
-    pub version: u64,
     pub size: u64,
     pub chunk_size: u32,
     pub is_dir: bool,
@@ -54,7 +52,6 @@ impl FileInfoModel {
         pb::FileInfo {
             inode: self.inode,
             path: self.path.clone(),
-            version: self.version,
             size: self.size,
             chunk_size: self.chunk_size,
             is_dir: self.is_dir,
@@ -68,7 +65,6 @@ pub struct DirectoryEntryModel {
     pub name: String,
     pub is_dir: bool,
     pub size: u64,
-    pub version: u64,
 }
 
 impl DirectoryEntryModel {
@@ -78,7 +74,6 @@ impl DirectoryEntryModel {
             name: self.name.clone(),
             is_dir: self.is_dir,
             size: self.size,
-            version: self.version,
         }
     }
 }
@@ -109,7 +104,6 @@ impl FileManifestModel {
                         addr_for(&replica.node_id).map(|addr| pb::ChunkReplica {
                             node_id: replica.node_id.clone(),
                             addr,
-                            version: replica.version,
                         })
                     })
                     .collect(),
@@ -127,7 +121,6 @@ impl FileManifestModel {
 pub struct UploadSessionModel {
     pub upload_id: String,
     pub lease_expiry_unix_ms: u64,
-    pub target_version: u64,
     pub chunk_size: u32,
     pub replication_factor: u32,
 }
@@ -137,7 +130,6 @@ impl UploadSessionModel {
         pb::UploadSession {
             upload_id: self.upload_id.clone(),
             lease_expiry_unix_ms: self.lease_expiry_unix_ms,
-            target_version: self.target_version,
             chunk_size: self.chunk_size,
             replication_factor: self.replication_factor,
         }
@@ -147,7 +139,6 @@ impl UploadSessionModel {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ChunkPlacementModel {
     pub chunk_id: String,
-    pub version: u64,
     pub replicas: Vec<ChunkReplicaAssignment>,
 }
 
@@ -155,21 +146,18 @@ pub struct ChunkPlacementModel {
 pub struct ChunkReplicaAssignment {
     pub node_id: String,
     pub addr: String,
-    pub version: u64,
 }
 
 impl ChunkPlacementModel {
     pub fn to_proto(&self) -> pb::ChunkPlacement {
         pb::ChunkPlacement {
             chunk_id: self.chunk_id.clone(),
-            version: self.version,
             replicas: self
                 .replicas
                 .iter()
                 .map(|replica| pb::ChunkReplica {
                     node_id: replica.node_id.clone(),
                     addr: replica.addr.clone(),
-                    version: replica.version,
                 })
                 .collect(),
         }
@@ -181,7 +169,6 @@ pub struct PendingChunk {
     pub chunk_id: String,
     pub size: u64,
     pub checksum: String,
-    pub version: u64,
     pub replicas: Vec<ChunkReplicaAssignment>,
 }
 
@@ -190,8 +177,6 @@ pub struct UploadSessionState {
     pub upload_id: String,
     pub path: String,
     pub mode: UploadModeModel,
-    pub base_version: Option<u64>,
-    pub target_version: u64,
     pub lease_expiry_unix_ms: u64,
     pub chunk_size: u32,
     pub replication_factor: u32,
@@ -203,7 +188,6 @@ pub struct ChunkRecord {
     pub chunk_id: String,
     pub size: u64,
     pub checksum: String,
-    pub version: u64,
     pub desired_replication: u32,
     pub replicas: Vec<ReplicaPointer>,
     pub ref_count: u64,
@@ -212,7 +196,6 @@ pub struct ChunkRecord {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ChunkTombstone {
     pub chunk_id: String,
-    pub version: u64,
     pub replicas: Vec<ReplicaPointer>,
     pub delete_after_unix_ms: u64,
 }
@@ -237,7 +220,6 @@ pub struct ChunkServerState {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ChunkInventoryEntry {
     pub chunk_id: String,
-    pub version: u64,
     pub checksum: String,
     pub size: u64,
 }
@@ -275,7 +257,6 @@ impl NamespaceEntry {
             Self::Directory(dir) => FileInfoModel {
                 inode: dir.inode,
                 path: dir.path.clone(),
-                version: 0,
                 size: 0,
                 chunk_size: 0,
                 is_dir: true,
@@ -351,7 +332,6 @@ impl MetadataStateMachine {
                     name: basename(entry_path).to_string(),
                     is_dir: info.is_dir,
                     size: info.size,
-                    version: info.version,
                 });
             }
         }
@@ -420,7 +400,6 @@ pub enum MetadataCommand {
     RecordReplicaRepair {
         chunk_id: String,
         node_id: String,
-        version: u64,
     },
     AckGarbage {
         chunk_ids: Vec<String>,
@@ -457,7 +436,6 @@ impl TryFrom<pb::CommitChunk> for CommitChunkModel {
                 .map(|replica| ChunkReplicaAssignment {
                     node_id: replica.node_id,
                     addr: replica.addr,
-                    version: replica.version,
                 })
                 .collect(),
         })

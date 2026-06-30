@@ -439,7 +439,6 @@ impl FileWriter {
 
         let header = pb::PutChunkHeader {
             chunk_id: placement.chunk_id.clone(),
-            version: placement.version,
             checksum: checksum.clone(),
             size: data.len() as u64,
             forward_targets: placement.replicas.iter().skip(1).cloned().collect(),
@@ -512,7 +511,6 @@ async fn read_chunk(client: &Client, chunk: &pb::ChunkRef) -> Result<Vec<u8>> {
             Ok(mut remote) => match remote
                 .get_chunk(pb::GetChunkRequest {
                     chunk_id: chunk.chunk_id.clone(),
-                    version: replica.version,
                 })
                 .await
             {

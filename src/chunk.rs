@@ -22,7 +22,6 @@ const STREAM_CHUNK_SIZE: usize = 64 * 1024;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct LocalChunkRecord {
     chunk_id: String,
-    version: u64,
     checksum: String,
     size: u64,
     file_name: String,
@@ -66,19 +65,13 @@ impl ChunkStore {
         }))
     }
 
-    pub async fn put_chunk(
-        &self,
-        chunk_id: &str,
-        version: u64,
-        checksum: &str,
-        data: &[u8],
-    ) -> Result<()> {
+    pub async fn put_chunk(&self, chunk_id: &str, checksum: &str, data: &[u8]) -> Result<()> {
         let calculated = checksum_hex(data);
         if calculated != checksum {
             bail!("checksum mismatch");
         }
 
-        let file_name = format!("{chunk_id}-{version}.chunk");
+        let file_name = format!("{chunk_id}.chunk");
         let path = self.data_dir.join("chunks").join(&file_name);
         let tmp_path = self
             .data_dir
@@ -98,7 +91,6 @@ impl ChunkStore {
 
         let record = LocalChunkRecord {
             chunk_id: chunk_id.to_string(),
-            version,
             checksum: checksum.to_string(),
             size: data.len() as u64,
             file_name,
@@ -116,7 +108,7 @@ impl ChunkStore {
         Ok(())
     }
 
-    async fn get_chunk(&self, chunk_id: &str, version: u64) -> Result<(LocalChunkRecord, Vec<u8>)> {
+    async fn get_chunk(&self, chunk_id: &str) -> Result<(LocalChunkRecord, Vec<u8>)> {
         let record = self
             .chunks
             .read()
@@ -124,9 +116,6 @@ impl ChunkStore {
             .get(chunk_id)
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("chunk not found"))?;
-        if record.version != version {
-            bail!("chunk version mismatch");
-        }
         let path = self.data_dir.join("chunks").join(&record.file_name);
         let data = fs::read(path).await?;
         if checksum_hex(&data) != record.checksum {
@@ -135,7 +124,7 @@ impl ChunkStore {
         Ok((record, data))
     }
 
-    pub async fn delete_chunk(&self, chunk_id: &str, version: u64) -> Result<()> {
+    pub async fn delete_chunk(&self, chunk_id: &str) -> Result<()> {
         let record = self
             .chunks
             .read()
@@ -143,9 +132,6 @@ impl ChunkStore {
             .get(chunk_id)
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("chunk not found"))?;
-        if record.version != version {
-            bail!("chunk version mismatch");
-        }
         let path = self.data_dir.join("chunks").join(&record.file_name);
         let _ = fs::remove_file(path).await;
         self.db.delete(chunk_key(chunk_id))?;
@@ -169,7 +155,6 @@ impl ChunkStore {
             .values()
             .map(|chunk| ChunkInventoryEntry {
                 chunk_id: chunk.chunk_id.clone(),
-                version: chunk.version,
                 checksum: chunk.checksum.clone(),
                 size: chunk.size,
             })
@@ -281,27 +266,20 @@ impl pb::chunk_service_server::ChunkService for ChunkGrpc {
         self.server
             .inner
             .store
-            .put_chunk(&header.chunk_id, header.version, &header.checksum, &data)
+            .put_chunk(&header.chunk_id, &header.checksum, &data)
             .await
             .map_err(internal_status)?;
 
         for replica in &header.forward_targets {
-            replicate_to_peer(
-                replica,
-                &header.chunk_id,
-                header.version,
-                &header.checksum,
-                data.clone(),
-            )
-            .await
-            .map_err(internal_status)?;
+            replicate_to_peer(replica, &header.chunk_id, &header.checksum, data.clone())
+                .await
+                .map_err(internal_status)?;
         }
 
         Ok(Response::new(pb::PutChunkResponse {
             replica: Some(pb::ChunkReplica {
                 node_id: self.server.inner.node_id.clone(),
                 addr: self.server.inner.addr.clone(),
-                version: header.version,
             }),
         }))
     }
@@ -317,14 +295,13 @@ impl pb::chunk_service_server::ChunkService for ChunkGrpc {
             .server
             .inner
             .store
-            .get_chunk(&request.chunk_id, request.version)
+            .get_chunk(&request.chunk_id)
             .await
             .map_err(internal_status)?;
         let node_id = self.server.inner.node_id.clone();
         let metadata = pb::GetChunkResponse {
             item: Some(pb::get_chunk_response::Item::Metadata(pb::ChunkMetadata {
                 chunk_id: record.chunk_id.clone(),
-                version: record.version,
                 checksum: record.checksum.clone(),
                 size: record.size,
                 node_id,
@@ -354,19 +331,13 @@ impl pb::chunk_service_server::ChunkService for ChunkGrpc {
         self.server
             .inner
             .store
-            .put_chunk(
-                &request.chunk_id,
-                request.version,
-                &request.checksum,
-                &request.data,
-            )
+            .put_chunk(&request.chunk_id, &request.checksum, &request.data)
             .await
             .map_err(internal_status)?;
         Ok(Response::new(pb::PutChunkResponse {
             replica: Some(pb::ChunkReplica {
                 node_id: self.server.inner.node_id.clone(),
                 addr: self.server.inner.addr.clone(),
-                version: request.version,
             }),
         }))
     }
@@ -379,7 +350,7 @@ impl pb::chunk_service_server::ChunkService for ChunkGrpc {
         self.server
             .inner
             .store
-            .delete_chunk(&request.chunk_id, request.version)
+            .delete_chunk(&request.chunk_id)
             .await
             .map_err(internal_status)?;
         Ok(Response::new(pb::Empty {}))
@@ -398,7 +369,6 @@ impl pb::chunk_service_server::ChunkService for ChunkGrpc {
                 .into_iter()
                 .map(|chunk| pb::InventoryChunk {
                     chunk_id: chunk.chunk_id,
-                    version: chunk.version,
                     checksum: chunk.checksum,
                     size: chunk.size,
                 })
@@ -425,7 +395,6 @@ async fn heartbeat_loop(server: ChunkServer) {
             .into_iter()
             .map(|chunk| pb::InventoryChunk {
                 chunk_id: chunk.chunk_id,
-                version: chunk.version,
                 checksum: chunk.checksum,
                 size: chunk.size,
             })
@@ -478,7 +447,6 @@ async fn send_heartbeat(
 async fn replicate_to_peer(
     replica: &pb::ChunkReplica,
     chunk_id: &str,
-    version: u64,
     checksum: &str,
     data: Vec<u8>,
 ) -> Result<()> {
@@ -486,7 +454,6 @@ async fn replicate_to_peer(
     client
         .replicate_chunk(pb::ReplicateChunkRequest {
             chunk_id: chunk_id.to_string(),
-            version,
             checksum: checksum.to_string(),
             data,
         })

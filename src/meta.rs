@@ -891,7 +891,6 @@ impl pb::metadata_service_server::MetadataService for MetadataGrpc {
             .into_iter()
             .map(|chunk| ChunkInventoryEntry {
                 chunk_id: chunk.chunk_id,
-                version: chunk.version,
                 checksum: chunk.checksum,
                 size: chunk.size,
             })
@@ -1133,10 +1132,7 @@ async fn gc_loop(node: MetadataNode) {
                     ok = false;
                     continue;
                 };
-                if delete_chunk(&addr, &tombstone.chunk_id, tombstone.version)
-                    .await
-                    .is_err()
-                {
+                if delete_chunk(&addr, &tombstone.chunk_id).await.is_err() {
                     ok = false;
                 }
             }
@@ -1179,7 +1175,7 @@ async fn repair_loop(node: MetadataNode) {
             let Some(source_addr) = state.chunk_server_addr(&source.node_id) else {
                 continue;
             };
-            let bytes = match fetch_chunk(&source_addr, &record.chunk_id, record.version).await {
+            let bytes = match fetch_chunk(&source_addr, &record.chunk_id).await {
                 Ok(bytes) => bytes,
                 Err(_) => continue,
             };
@@ -1201,7 +1197,6 @@ async fn repair_loop(node: MetadataNode) {
                 if replicate_chunk(
                     &target.addr,
                     &record.chunk_id,
-                    record.version,
                     &record.checksum,
                     bytes.clone(),
                 )
@@ -1212,7 +1207,6 @@ async fn repair_loop(node: MetadataNode) {
                         .write_command(MetadataCommand::RecordReplicaRepair {
                             chunk_id: record.chunk_id.clone(),
                             node_id: target.node_id.clone(),
-                            version: record.version,
                         })
                         .await;
                 }
@@ -1283,11 +1277,9 @@ fn apply_command(
             node_id,
             reason,
         } => apply_report_replica_failure(state, &chunk_id, &node_id, &reason),
-        MetadataCommand::RecordReplicaRepair {
-            chunk_id,
-            node_id,
-            version,
-        } => apply_record_replica_repair(state, &chunk_id, &node_id, version),
+        MetadataCommand::RecordReplicaRepair { chunk_id, node_id } => {
+            apply_record_replica_repair(state, &chunk_id, &node_id)
+        }
         MetadataCommand::AckGarbage { chunk_ids } => {
             for chunk_id in chunk_ids {
                 state.tombstones.remove(&chunk_id);
@@ -1323,7 +1315,6 @@ fn apply_mkdir(state: &mut MetadataStateMachine, path: &str) -> Result<MetadataR
     let info = FileInfoModel {
         inode,
         path: path.clone(),
-        version: 0,
         size: 0,
         chunk_size: 0,
         is_dir: true,
@@ -1456,21 +1447,18 @@ fn apply_begin_upload(
         bail!("path already has an active upload");
     }
 
-    let base_version = match (mode, state.entries.get(&path)) {
-        (UploadModeModel::Create, None) => None,
+    match (mode, state.entries.get(&path)) {
+        (UploadModeModel::Create, None) => {}
         (UploadModeModel::Create, Some(_)) => bail!("path already exists"),
-        (UploadModeModel::Overwrite, Some(NamespaceEntry::File(file))) => Some(file.info.version),
+        (UploadModeModel::Overwrite, Some(NamespaceEntry::File(_))) => {}
         (UploadModeModel::Overwrite, Some(_)) => bail!("path is not a file"),
         (UploadModeModel::Overwrite, None) => bail!("file does not exist"),
-    };
+    }
 
-    let target_version = base_version.unwrap_or(0) + 1;
     let session = UploadSessionState {
         upload_id,
         path: path.clone(),
         mode,
-        base_version,
-        target_version,
         lease_expiry_unix_ms: now_ms + lease_ttl_ms,
         chunk_size,
         replication_factor,
@@ -1479,7 +1467,6 @@ fn apply_begin_upload(
     let response = UploadSessionModel {
         upload_id: session.upload_id.clone(),
         lease_expiry_unix_ms: session.lease_expiry_unix_ms,
-        target_version: session.target_version,
         chunk_size: session.chunk_size,
         replication_factor: session.replication_factor,
     };
@@ -1516,7 +1503,6 @@ fn apply_allocate_chunk(
         .map(|server| ChunkReplicaAssignment {
             node_id: server.node_id,
             addr: server.addr,
-            version: session.target_version,
         })
         .collect::<Vec<_>>();
 
@@ -1524,13 +1510,11 @@ fn apply_allocate_chunk(
         chunk_id: chunk_id.to_string(),
         size,
         checksum: checksum.to_string(),
-        version: session.target_version,
         replicas: replicas.clone(),
     };
     session.allocations.insert(chunk_id.to_string(), pending);
     Ok(MetadataResponse::ChunkPlacement(ChunkPlacementModel {
         chunk_id: chunk_id.to_string(),
-        version: session.target_version,
         replicas,
     }))
 }
@@ -1594,7 +1578,6 @@ fn apply_commit_upload(
                 .iter()
                 .map(|replica| ReplicaPointer {
                     node_id: replica.node_id.clone(),
-                    version: replica.version,
                 })
                 .collect(),
         });
@@ -1618,7 +1601,6 @@ fn apply_commit_upload(
     let info = FileInfoModel {
         inode,
         path: session.path.clone(),
-        version: session.target_version,
         size: next_offset,
         chunk_size: session.chunk_size,
         is_dir: false,
@@ -1640,7 +1622,6 @@ fn apply_commit_upload(
                         chunk_id: chunk.chunk_id.clone(),
                         size: chunk.size,
                         checksum: chunk.checksum.clone(),
-                        version: session.target_version,
                         desired_replication: session.replication_factor,
                         replicas: chunk.replicas.clone(),
                         ref_count: 1,
@@ -1701,11 +1682,10 @@ fn apply_heartbeat(
             .iter()
             .any(|replica| replica.node_id == node_id);
         match inventory_map.get(&chunk_id) {
-            Some(local) if local.checksum == record.checksum && local.version == record.version => {
+            Some(local) if local.checksum == record.checksum && local.size == record.size => {
                 if !previous_had_replica {
                     record.replicas.push(ReplicaPointer {
                         node_id: node_id.clone(),
-                        version: local.version,
                     });
                 }
                 prune_repair(record, &mut state.repairs);
@@ -1739,7 +1719,6 @@ fn apply_record_replica_repair(
     state: &mut MetadataStateMachine,
     chunk_id: &str,
     node_id: &str,
-    version: u64,
 ) -> Result<MetadataResponse> {
     let Some(record) = state.chunk_records.get_mut(chunk_id) else {
         bail!("chunk not found: {chunk_id}");
@@ -1751,7 +1730,6 @@ fn apply_record_replica_repair(
     {
         record.replicas.push(ReplicaPointer {
             node_id: node_id.to_string(),
-            version,
         });
     }
     prune_repair(record, &mut state.repairs);
@@ -1806,7 +1784,6 @@ fn release_manifest_chunks(
                     chunk.chunk_id.clone(),
                     ChunkTombstone {
                         chunk_id: chunk.chunk_id.clone(),
-                        version: record.version,
                         replicas: record.replicas.clone(),
                         delete_after_unix_ms: now_ms + gc_grace_ms,
                     },
@@ -1883,7 +1860,6 @@ fn file_manifest_to_proto(state: &MetadataStateMachine, file: &FileRecord) -> pb
                                 .map(|addr| pb::ChunkReplica {
                                     node_id: replica.node_id.clone(),
                                     addr,
-                                    version: replica.version,
                                 })
                         })
                         .collect(),
@@ -1973,12 +1949,11 @@ async fn chunk_client(
     pb::chunk_service_client::ChunkServiceClient::connect(format!("http://{addr}")).await
 }
 
-async fn fetch_chunk(addr: &str, chunk_id: &str, version: u64) -> Result<Vec<u8>> {
+async fn fetch_chunk(addr: &str, chunk_id: &str) -> Result<Vec<u8>> {
     let mut client = chunk_client(addr).await?;
     let mut stream = client
         .get_chunk(pb::GetChunkRequest {
             chunk_id: chunk_id.to_string(),
-            version,
         })
         .await?
         .into_inner();
@@ -1991,18 +1966,11 @@ async fn fetch_chunk(addr: &str, chunk_id: &str, version: u64) -> Result<Vec<u8>
     Ok(bytes)
 }
 
-async fn replicate_chunk(
-    addr: &str,
-    chunk_id: &str,
-    version: u64,
-    checksum: &str,
-    data: Vec<u8>,
-) -> Result<()> {
+async fn replicate_chunk(addr: &str, chunk_id: &str, checksum: &str, data: Vec<u8>) -> Result<()> {
     let mut client = chunk_client(addr).await?;
     client
         .replicate_chunk(pb::ReplicateChunkRequest {
             chunk_id: chunk_id.to_string(),
-            version,
             checksum: checksum.to_string(),
             data,
         })
@@ -2010,12 +1978,11 @@ async fn replicate_chunk(
     Ok(())
 }
 
-async fn delete_chunk(addr: &str, chunk_id: &str, version: u64) -> Result<()> {
+async fn delete_chunk(addr: &str, chunk_id: &str) -> Result<()> {
     let mut client = chunk_client(addr).await?;
     client
         .delete_chunk(pb::DeleteChunkRequest {
             chunk_id: chunk_id.to_string(),
-            version,
         })
         .await?;
     Ok(())
