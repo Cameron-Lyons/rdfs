@@ -236,15 +236,6 @@ pub struct FileRecord {
     pub chunks: Vec<ChunkRefModel>,
 }
 
-impl FileRecord {
-    pub fn manifest(&self) -> FileManifestModel {
-        FileManifestModel {
-            info: self.info.clone(),
-            chunks: self.chunks.clone(),
-        }
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum NamespaceEntry {
     Directory(DirectoryRecord),
@@ -304,10 +295,6 @@ impl Default for MetadataStateMachine {
 }
 
 impl MetadataStateMachine {
-    pub fn get_entry(&self, path: &str) -> Option<&NamespaceEntry> {
-        self.entries.get(path)
-    }
-
     pub fn list_directory(&self, path: &str) -> Result<Vec<DirectoryEntryModel>> {
         let path = normalize_path(path)?;
         let Some(entry) = self.entries.get(&path) else {
@@ -349,11 +336,6 @@ pub enum MetadataCommand {
     Mkdir {
         path: String,
     },
-    Rename {
-        from: String,
-        to: String,
-        now_ms: u64,
-    },
     Delete {
         path: String,
         now_ms: u64,
@@ -380,9 +362,6 @@ pub enum MetadataCommand {
         chunks: Vec<CommitChunkModel>,
         now_ms: u64,
         gc_grace_ms: u64,
-    },
-    AbortUpload {
-        upload_id: String,
     },
     Heartbeat {
         node_id: String,
@@ -449,6 +428,5 @@ pub enum MetadataResponse {
     FileManifest(FileManifestModel),
     UploadSession(UploadSessionModel),
     ChunkPlacement(ChunkPlacementModel),
-    Entries(Vec<DirectoryEntryModel>),
     Error(String),
 }
