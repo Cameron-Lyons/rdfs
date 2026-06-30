@@ -1,6 +1,7 @@
 use crate::pb;
 use crate::util::checksum_hex;
 use anyhow::{Result, bail};
+use futures_util::stream;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -443,7 +444,7 @@ impl FileWriter {
             size: data.len() as u64,
             forward_targets: placement.replicas.iter().skip(1).cloned().collect(),
         };
-        let stream = tokio_stream::iter(vec![
+        let stream = stream::iter(vec![
             pb::PutChunkRequest {
                 item: Some(pb::put_chunk_request::Item::Header(header)),
             },
