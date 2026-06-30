@@ -111,7 +111,7 @@ impl TestCluster {
 }
 
 async fn start_cluster(base_port: u16) -> anyhow::Result<TestCluster> {
-    let root_dir = PathBuf::from(format!("/tmp/rdfs-v3-test-{base_port}"));
+    let root_dir = PathBuf::from(format!("/tmp/rdfs-test-{base_port}"));
     let _ = tokio::fs::remove_dir_all(&root_dir).await;
     tokio::fs::create_dir_all(&root_dir).await?;
 

@@ -1,8 +1,6 @@
-# RDFS v3
+# RDFS
 
 RDFS is now a gRPC-based distributed file store with Raft-backed metadata, immutable chunk replicas, and manifest-based atomic commits.
-
-This rewrite intentionally breaks compatibility with the previous JSON/TCP prototype. The old wire protocol, public client API, and checked-in metadata/block artifacts are not part of v3.
 
 ## Components
 
@@ -18,21 +16,21 @@ This rewrite intentionally breaks compatibility with the previous JSON/TCP proto
 - Chunkservers store immutable chunk files on disk with a RocksDB index.
 - Writers upload chunks to a primary replica, which stores locally and forwards to secondaries before acknowledging.
 - `CommitUpload` atomically swaps the visible file manifest, so uncommitted uploads remain invisible.
-- Reads are leader-only in v1 and use leader-lease reads before serving metadata.
+- Reads use leader leases before serving metadata.
 - Readers report corrupt or unreadable chunk replicas back to metadata so the repair loop can restore replication.
 - Chunkserver heartbeats reconcile on-disk inventory back into metadata, so restarted replicas rejoin fresh manifests automatically.
 - Metadata membership can be changed online by adding learners, promoting voters, removing dead nodes, and replacing failed voters.
 
 ## Client API
 
-The Rust client surface is now high-level:
+The Rust client surface is high-level:
 
 - `Client::create_writer(path, options)`
 - `Client::overwrite_writer(path, options)`
 - `Client::open_reader(path)`
 - `Client::stat/list/mkdir/rename/delete`
 
-There is no public per-block mutation API in v3.
+There is no public per-block mutation API.
 
 ## Quick Start
 
@@ -100,4 +98,3 @@ Current test coverage includes:
 - append or random in-place writes
 - follower-served linearizable reads
 - metadata sharding
-- migration from the old prototype’s protocol or disk format

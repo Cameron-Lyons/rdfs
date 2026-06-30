@@ -24,7 +24,7 @@ async fn main() -> anyhow::Result<()> {
             let mut writer = client
                 .create_writer("/demo/demo.txt", WriteOptions::default())
                 .await?;
-            writer.write(b"rdfs v3 demo").await?;
+            writer.write(b"rdfs demo").await?;
             writer.commit().await?;
             let reader = client.open_reader("/demo/demo.txt").await?;
             println!("{}", String::from_utf8_lossy(&reader.read_all().await?));
