@@ -336,7 +336,9 @@ impl pb::chunk_service_server::ChunkService for ChunkGrpc {
             }
             let end = (offset + STREAM_CHUNK_SIZE).min(data.len());
             let response = pb::GetChunkResponse {
-                item: Some(pb::get_chunk_response::Item::Data(data[offset..end].to_vec())),
+                item: Some(pb::get_chunk_response::Item::Data(
+                    data[offset..end].to_vec(),
+                )),
             };
             Some((Ok(response), (data, end)))
         });
