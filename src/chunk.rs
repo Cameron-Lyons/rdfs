@@ -2,7 +2,7 @@ use crate::model::ChunkInventoryEntry;
 use crate::pb;
 use crate::util::checksum_hex;
 use anyhow::{Result, bail};
-use async_stream::try_stream;
+use futures_util::{StreamExt, stream};
 use rocksdb::{DB, Options};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -321,22 +321,26 @@ impl pb::chunk_service_server::ChunkService for ChunkGrpc {
             .await
             .map_err(internal_status)?;
         let node_id = self.server.inner.node_id.clone();
-        let stream = try_stream! {
-            yield pb::GetChunkResponse {
-                item: Some(pb::get_chunk_response::Item::Metadata(pb::ChunkMetadata {
-                    chunk_id: record.chunk_id.clone(),
-                    version: record.version,
-                    checksum: record.checksum.clone(),
-                    size: record.size,
-                    node_id,
-                })),
-            };
-            for chunk in data.chunks(STREAM_CHUNK_SIZE) {
-                yield pb::GetChunkResponse {
-                    item: Some(pb::get_chunk_response::Item::Data(chunk.to_vec())),
-                };
-            }
+        let metadata = pb::GetChunkResponse {
+            item: Some(pb::get_chunk_response::Item::Metadata(pb::ChunkMetadata {
+                chunk_id: record.chunk_id.clone(),
+                version: record.version,
+                checksum: record.checksum.clone(),
+                size: record.size,
+                node_id,
+            })),
         };
+        let data_stream = stream::unfold((data, 0usize), |(data, offset)| async move {
+            if offset >= data.len() {
+                return None;
+            }
+            let end = (offset + STREAM_CHUNK_SIZE).min(data.len());
+            let response = pb::GetChunkResponse {
+                item: Some(pb::get_chunk_response::Item::Data(data[offset..end].to_vec())),
+            };
+            Some((Ok(response), (data, end)))
+        });
+        let stream = stream::once(async move { Ok::<_, Status>(metadata) }).chain(data_stream);
         Ok(Response::new(Box::pin(stream) as Self::GetChunkStream))
     }
 
