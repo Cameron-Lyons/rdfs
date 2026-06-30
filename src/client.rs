@@ -346,18 +346,13 @@ impl Client {
         .await
     }
 
-    fn report_replica_failure_best_effort(
+    async fn report_replica_failure_best_effort(
         &self,
         chunk_id: String,
         node_id: String,
         reason: String,
     ) {
-        let client = self.clone();
-        tokio::spawn(async move {
-            let _ = client
-                .report_replica_failure(chunk_id, node_id, reason)
-                .await;
-        });
+        let _ = self.report_replica_failure(chunk_id, node_id, reason).await;
     }
 }
 
@@ -530,40 +525,48 @@ async fn read_chunk(client: &Client, chunk: &pb::ChunkRef) -> Result<Vec<u8>> {
                         }
                     }
                     let Some(metadata) = metadata else {
-                        client.report_replica_failure_best_effort(
-                            chunk.chunk_id.clone(),
-                            replica.node_id.clone(),
-                            "missing chunk metadata".to_string(),
-                        );
+                        client
+                            .report_replica_failure_best_effort(
+                                chunk.chunk_id.clone(),
+                                replica.node_id.clone(),
+                                "missing chunk metadata".to_string(),
+                            )
+                            .await;
                         last_error = Some(anyhow::anyhow!("missing chunk metadata"));
                         continue;
                     };
                     if checksum_hex(&bytes) != metadata.checksum {
-                        client.report_replica_failure_best_effort(
-                            chunk.chunk_id.clone(),
-                            replica.node_id.clone(),
-                            "checksum mismatch while reading chunk".to_string(),
-                        );
+                        client
+                            .report_replica_failure_best_effort(
+                                chunk.chunk_id.clone(),
+                                replica.node_id.clone(),
+                                "checksum mismatch while reading chunk".to_string(),
+                            )
+                            .await;
                         last_error = Some(anyhow::anyhow!("checksum mismatch while reading chunk"));
                         continue;
                     }
                     return Ok(bytes);
                 }
                 Err(status) => {
-                    client.report_replica_failure_best_effort(
-                        chunk.chunk_id.clone(),
-                        replica.node_id.clone(),
-                        format!("read failure from {}: {status}", replica.addr),
-                    );
+                    client
+                        .report_replica_failure_best_effort(
+                            chunk.chunk_id.clone(),
+                            replica.node_id.clone(),
+                            format!("read failure from {}: {status}", replica.addr),
+                        )
+                        .await;
                     last_error = Some(anyhow::anyhow!("chunk replica {}: {status}", replica.addr))
                 }
             },
             Err(error) => {
-                client.report_replica_failure_best_effort(
-                    chunk.chunk_id.clone(),
-                    replica.node_id.clone(),
-                    format!("transport failure to {}: {error}", replica.addr),
-                );
+                client
+                    .report_replica_failure_best_effort(
+                        chunk.chunk_id.clone(),
+                        replica.node_id.clone(),
+                        format!("transport failure to {}: {error}", replica.addr),
+                    )
+                    .await;
                 last_error = Some(anyhow::anyhow!("chunk replica {}: {error}", replica.addr))
             }
         }

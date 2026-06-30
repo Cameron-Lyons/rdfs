@@ -8,7 +8,7 @@ use crate::model::{
 use crate::path::{is_child_of, normalize_path, parent_path, replace_prefix};
 use crate::pb;
 use crate::raft::{MetaNodeId, MetaRaft, MetaTypeConfig};
-use crate::util::now_millis;
+use crate::util::{checksum_hex, now_millis};
 use anyhow::{Result, bail};
 use futures_util::{Stream, TryStreamExt};
 use openraft::entry::RaftEntry;
@@ -1169,15 +1169,8 @@ async fn repair_loop(node: MetadataNode) {
             let Some(record) = state.chunk_records.get(&repair.chunk_id) else {
                 continue;
             };
-            let Some(source) = record.replicas.first() else {
+            let Some(bytes) = fetch_repair_source(&state, record).await else {
                 continue;
-            };
-            let Some(source_addr) = state.chunk_server_addr(&source.node_id) else {
-                continue;
-            };
-            let bytes = match fetch_chunk(&source_addr, &record.chunk_id).await {
-                Ok(bytes) => bytes,
-                Err(_) => continue,
             };
 
             let active_targets = active_chunk_servers(&state)
@@ -1213,6 +1206,24 @@ async fn repair_loop(node: MetadataNode) {
             }
         }
     }
+}
+
+async fn fetch_repair_source(
+    state: &MetadataStateMachine,
+    record: &ChunkRecord,
+) -> Option<Vec<u8>> {
+    for replica in &record.replicas {
+        let Some(source_addr) = state.chunk_server_addr(&replica.node_id) else {
+            continue;
+        };
+        let Ok(bytes) = fetch_chunk(&source_addr, &record.chunk_id).await else {
+            continue;
+        };
+        if bytes.len() as u64 == record.size && checksum_hex(&bytes) == record.checksum {
+            return Some(bytes);
+        }
+    }
+    None
 }
 
 fn apply_command(
