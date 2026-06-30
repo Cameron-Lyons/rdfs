@@ -10,15 +10,15 @@ anyhow = "1.0.100"
 futures-util = "0.3.31"
 openraft = { version = "0.10.0-alpha.15", features = ["serde"] }
 prost = "0.14.1"
-rocksdb = { version = "0.24.0", default-features = false, features = ["snappy"] }
+rocksdb = { version = "0.24.0", default-features = false }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 sha2 = "0.11.0"
-tokio = { version = "1.49.0", features = ["full"] }
+tokio = { version = "1.49.0", features = ["fs", "io-util", "macros", "rt-multi-thread", "signal", "sync", "time"] }
 tonic = { version = "0.14.5", features = ["transport"] }
 tonic-prost = "0.14.2"
-tracing-subscriber = { version = "0.3.20", features = ["env-filter", "fmt"] }
-uuid = { version = "1.18.1", features = ["serde", "v4"] }
+tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
+uuid = { version = "1.18.1", features = ["v4"] }
 
 [build-dependencies]
 protoc-bin-vendored = "3.2.0"
@@ -39,7 +39,3 @@ path = "src/bin/rdfs-client.rs"
 [[bin]]
 name = "rdfs-local"
 path = "src/bin/rdfs-local.rs"
-
-[[bin]]
-name = "xtask"
-path = "src/bin/xtask.rs"

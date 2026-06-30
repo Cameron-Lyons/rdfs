@@ -48,14 +48,6 @@ pub fn basename(path: &str) -> &str {
     }
 }
 
-pub fn replace_prefix(path: &str, from: &str, to: &str) -> String {
-    if path == from {
-        return to.to_string();
-    }
-    let suffix = path.strip_prefix(from).unwrap_or(path);
-    format!("{to}{suffix}")
-}
-
 pub fn is_child_of(path: &str, parent: &str) -> bool {
     if parent == "/" {
         return path != "/";

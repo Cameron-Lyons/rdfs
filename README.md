@@ -7,7 +7,7 @@ RDFS is now a gRPC-based distributed file store with Raft-backed metadata, immut
 - `rdfs-meta`: metadata node with the public `MetadataService` plus internal `RaftService`
 - `rdfs-chunk`: chunkserver with streamed chunk upload/download and replica forwarding
 - `rdfs-client`: CLI for `mkdir`, `ls`, `put`, `cat`, `rm`, `stat`, and `demo`
-- `rdfs-local` / `xtask`: 3-meta / 3-chunk local cluster harness
+- `rdfs-local`: 3-meta / 3-chunk local cluster harness
 
 ## Design
 
@@ -28,7 +28,7 @@ The Rust client surface is high-level:
 - `Client::create_writer(path, options)`
 - `Client::overwrite_writer(path, options)`
 - `Client::open_reader(path)`
-- `Client::stat/list/mkdir/rename/delete`
+- `Client::stat/list/mkdir/delete`
 
 There is no public per-block mutation API.
 

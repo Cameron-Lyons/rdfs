@@ -355,26 +355,6 @@ impl pb::chunk_service_server::ChunkService for ChunkGrpc {
             .map_err(internal_status)?;
         Ok(Response::new(pb::Empty {}))
     }
-
-    async fn report_inventory(
-        &self,
-        _request: Request<pb::ReportInventoryRequest>,
-    ) -> Result<Response<pb::ReportInventoryResponse>, Status> {
-        let inventory = self.server.inner.store.inventory().await;
-        Ok(Response::new(pb::ReportInventoryResponse {
-            node_id: self.server.inner.node_id.clone(),
-            capacity: self.server.inner.capacity,
-            used: self.server.inner.store.used().await,
-            inventory: inventory
-                .into_iter()
-                .map(|chunk| pb::InventoryChunk {
-                    chunk_id: chunk.chunk_id,
-                    checksum: chunk.checksum,
-                    size: chunk.size,
-                })
-                .collect(),
-        }))
-    }
 }
 
 async fn heartbeat_loop(server: ChunkServer) {

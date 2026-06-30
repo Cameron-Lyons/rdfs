@@ -5,7 +5,7 @@ use crate::model::{
     NamespaceEntry, PendingChunk, RepairTask, ReplicaPointer, UploadModeModel, UploadSessionModel,
     UploadSessionState,
 };
-use crate::path::{is_child_of, normalize_path, parent_path, replace_prefix};
+use crate::path::{is_child_of, normalize_path, parent_path};
 use crate::pb;
 use crate::raft::{MetaNodeId, MetaRaft, MetaTypeConfig};
 use crate::util::{checksum_hex, now_millis};
@@ -731,23 +731,6 @@ impl pb::metadata_service_server::MetadataService for MetadataGrpc {
         )?))
     }
 
-    async fn rename(
-        &self,
-        request: Request<pb::RenameRequest>,
-    ) -> Result<Response<pb::Empty>, Status> {
-        let request = request.into_inner();
-        let response = self
-            .node
-            .write_command(MetadataCommand::Rename {
-                from: request.from,
-                to: request.to,
-                now_ms: now_millis(),
-            })
-            .await?;
-        MetadataNode::response_as_ack(response)?;
-        Ok(Response::new(pb::Empty {}))
-    }
-
     async fn delete(
         &self,
         request: Request<pb::DeleteRequest>,
@@ -848,20 +831,6 @@ impl pb::metadata_service_server::MetadataService for MetadataGrpc {
             MetadataResponse::Error(error) => return Err(Status::failed_precondition(error)),
             other => return Err(Status::internal(format!("unexpected response: {other:?}"))),
         }))
-    }
-
-    async fn abort_upload(
-        &self,
-        request: Request<pb::AbortUploadRequest>,
-    ) -> Result<Response<pb::Empty>, Status> {
-        let response = self
-            .node
-            .write_command(MetadataCommand::AbortUpload {
-                upload_id: request.into_inner().upload_id,
-            })
-            .await?;
-        MetadataNode::response_as_ack(response)?;
-        Ok(Response::new(pb::Empty {}))
     }
 
     async fn report_replica_failure(
@@ -1232,7 +1201,6 @@ fn apply_command(
 ) -> Result<MetadataResponse> {
     match command {
         MetadataCommand::Mkdir { path } => apply_mkdir(state, &path),
-        MetadataCommand::Rename { from, to, now_ms } => apply_rename(state, &from, &to, now_ms),
         MetadataCommand::Delete {
             path,
             now_ms,
@@ -1271,10 +1239,6 @@ fn apply_command(
             now_ms,
             gc_grace_ms,
         } => apply_commit_upload(state, &upload_id, chunks, now_ms, gc_grace_ms),
-        MetadataCommand::AbortUpload { upload_id } => {
-            state.upload_sessions.remove(&upload_id);
-            Ok(MetadataResponse::Ack)
-        }
         MetadataCommand::Heartbeat {
             node_id,
             addr,
@@ -1335,67 +1299,6 @@ fn apply_mkdir(state: &mut MetadataStateMachine, path: &str) -> Result<MetadataR
         NamespaceEntry::Directory(DirectoryRecord { inode, path }),
     );
     Ok(MetadataResponse::FileInfo(info))
-}
-
-fn apply_rename(
-    state: &mut MetadataStateMachine,
-    from: &str,
-    to: &str,
-    now_ms: u64,
-) -> Result<MetadataResponse> {
-    let from = normalize_path(from)?;
-    let to = normalize_path(to)?;
-    if from == "/" {
-        bail!("cannot rename root");
-    }
-    if from == to {
-        return Ok(MetadataResponse::Ack);
-    }
-    if !state.entries.contains_key(&from) {
-        bail!("not found: {from}");
-    }
-    if state.entries.contains_key(&to) {
-        bail!("target already exists: {to}");
-    }
-    if to.starts_with(&format!("{from}/")) {
-        bail!("cannot move directory into itself");
-    }
-    let parent = parent_path(&to).ok_or_else(|| anyhow::anyhow!("missing target parent"))?;
-    ensure_directory_exists(state, &parent)?;
-    if has_upload_on_path(state, &from, now_ms) {
-        bail!("path has active upload: {from}");
-    }
-
-    let affected = state
-        .entries
-        .keys()
-        .filter(|path| **path == from || is_child_of(path, &from))
-        .cloned()
-        .collect::<Vec<_>>();
-
-    let mut moved = Vec::new();
-    for old_path in affected {
-        if let Some(entry) = state.entries.remove(&old_path) {
-            moved.push((old_path, entry));
-        }
-    }
-
-    moved.sort_by_key(|a| a.0.len());
-    for (old_path, entry) in moved {
-        let new_path = replace_prefix(&old_path, &from, &to);
-        let new_entry = match entry {
-            NamespaceEntry::Directory(dir) => NamespaceEntry::Directory(DirectoryRecord {
-                inode: dir.inode,
-                path: new_path.clone(),
-            }),
-            NamespaceEntry::File(mut file) => {
-                file.info.path = new_path.clone();
-                NamespaceEntry::File(file)
-            }
-        };
-        state.entries.insert(new_path, new_entry);
-    }
-    Ok(MetadataResponse::Ack)
 }
 
 fn apply_delete(

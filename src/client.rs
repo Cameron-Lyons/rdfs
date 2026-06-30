@@ -91,22 +91,6 @@ impl Client {
         .await
     }
 
-    pub async fn rename(&self, from: &str, to: &str) -> Result<()> {
-        let from = from.to_string();
-        let to = to.to_string();
-        self.call_metadata(|client| {
-            let from = from.clone();
-            let to = to.clone();
-            Box::pin(async move {
-                client
-                    .rename(pb::RenameRequest { from, to })
-                    .await
-                    .map(|_| ())
-            })
-        })
-        .await
-    }
-
     pub async fn delete(&self, path: &str) -> Result<()> {
         let path = path.to_string();
         self.call_metadata(|client| {
@@ -395,21 +379,6 @@ impl FileWriter {
         Ok(manifest)
     }
 
-    pub async fn abort(self) -> Result<()> {
-        let upload_id = self.session.upload_id.clone();
-        self.client
-            .call_metadata(|client| {
-                let upload_id = upload_id.clone();
-                Box::pin(async move {
-                    client
-                        .abort_upload(pb::AbortUploadRequest { upload_id })
-                        .await
-                        .map(|_| ())
-                })
-            })
-            .await
-    }
-
     async fn flush_chunk(&mut self, data: Vec<u8>) -> Result<()> {
         let checksum = checksum_hex(&data);
         let upload_id = self.session.upload_id.clone();
@@ -476,24 +445,6 @@ impl FileReader {
         let mut result = Vec::new();
         for chunk in &self.manifest.chunks {
             result.extend_from_slice(&read_chunk(&self.client, chunk).await?);
-        }
-        Ok(result)
-    }
-
-    pub async fn read_range(&self, offset: u64, length: u64) -> Result<Vec<u8>> {
-        let mut result = Vec::new();
-        let range_end = offset.saturating_add(length);
-        for chunk in &self.manifest.chunks {
-            let chunk_start = chunk.offset;
-            let chunk_end = chunk.offset.saturating_add(chunk.size);
-            if chunk_end <= offset || chunk_start >= range_end {
-                continue;
-            }
-
-            let data = read_chunk(&self.client, chunk).await?;
-            let local_start = offset.saturating_sub(chunk_start) as usize;
-            let local_end = (range_end.min(chunk_end) - chunk_start) as usize;
-            result.extend_from_slice(&data[local_start..local_end]);
         }
         Ok(result)
     }

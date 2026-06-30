@@ -85,11 +85,6 @@ message MkdirRequest {
   string path = 1;
 }
 
-message RenameRequest {
-  string from = 1;
-  string to = 2;
-}
-
 message DeleteRequest {
   string path = 1;
 }
@@ -114,10 +109,6 @@ message AllocateChunkRequest {
 message CommitUploadRequest {
   string upload_id = 1;
   repeated CommitChunk chunks = 2;
-}
-
-message AbortUploadRequest {
-  string upload_id = 1;
 }
 
 message ReportReplicaFailureRequest {
@@ -208,17 +199,6 @@ message DeleteChunkRequest {
   string chunk_id = 1;
 }
 
-message ReportInventoryRequest {
-  bool include_chunks = 1;
-}
-
-message ReportInventoryResponse {
-  string node_id = 1;
-  uint64 capacity = 2;
-  uint64 used = 3;
-  repeated InventoryChunk inventory = 4;
-}
-
 message JsonEnvelope {
   bytes json = 1;
 }
@@ -233,13 +213,11 @@ service MetadataService {
   rpc Stat(StatRequest) returns (FileInfo);
   rpc List(ListRequest) returns (ListResponse);
   rpc Mkdir(MkdirRequest) returns (FileInfo);
-  rpc Rename(RenameRequest) returns (Empty);
   rpc Delete(DeleteRequest) returns (Empty);
   rpc OpenFile(OpenFileRequest) returns (FileManifest);
   rpc BeginUpload(BeginUploadRequest) returns (UploadSession);
   rpc AllocateChunk(AllocateChunkRequest) returns (ChunkPlacement);
   rpc CommitUpload(CommitUploadRequest) returns (FileManifest);
-  rpc AbortUpload(AbortUploadRequest) returns (Empty);
   rpc ReportReplicaFailure(ReportReplicaFailureRequest) returns (Empty);
   rpc Heartbeat(HeartbeatRequest) returns (Empty);
   rpc GetClusterMembership(Empty) returns (ClusterMembership);
@@ -253,7 +231,6 @@ service ChunkService {
   rpc GetChunk(GetChunkRequest) returns (stream GetChunkResponse);
   rpc ReplicateChunk(ReplicateChunkRequest) returns (PutChunkResponse);
   rpc DeleteChunk(DeleteChunkRequest) returns (Empty);
-  rpc ReportInventory(ReportInventoryRequest) returns (ReportInventoryResponse);
 }
 
 service RaftService {
