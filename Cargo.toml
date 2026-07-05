@@ -8,7 +8,7 @@ autobins = false
 [dependencies]
 anyhow = "1.0.100"
 futures-util = "0.3.31"
-openraft = { version = "0.10.0-alpha.15", features = ["serde"] }
+openraft = { version = "0.10.0-alpha.27", features = ["serde", "type-alias"] }
 prost = "0.14.1"
 rocksdb = { version = "0.24.0", default-features = false }
 serde = { version = "1.0.228", features = ["derive"] }

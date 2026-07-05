@@ -6,8 +6,8 @@ openraft::declare_raft_types!(
         R = crate::model::MetadataResponse,
         Node = openraft::BasicNode,
         SnapshotData = Cursor<Vec<u8>>,
-        LeaderId = openraft::impls::leader_id_std::LeaderId<Self>,
+        LeaderId = openraft::impls::leader_id_std::LeaderId<Self::Term, Self::NodeId>,
 );
 
 pub type MetaNodeId = u64;
-pub type MetaRaft = openraft::Raft<MetaTypeConfig>;
+pub type MetaRaft = openraft::Raft<MetaTypeConfig, std::sync::Arc<crate::meta::MetaStore>>;

@@ -12,6 +12,7 @@ use crate::raft::{MetaNodeId, MetaRaft, MetaTypeConfig};
 use crate::util::{checksum_hex, now_millis, unique_id};
 use anyhow::{Result, bail};
 use futures_util::{Stream, StreamExt, TryStreamExt, stream};
+use openraft::alias::{EntryOf, LogIdOf, SnapshotMetaOf, SnapshotOf, StoredMembershipOf, VoteOf};
 use openraft::entry::RaftEntry;
 use openraft::error::{ForwardToLeader, NetworkError, RPCError, RaftError, Unreachable};
 use openraft::network::{RPCOption, RaftNetworkFactory, RaftNetworkV2};
@@ -21,8 +22,7 @@ use openraft::storage::{
     RaftStateMachine, Snapshot,
 };
 use openraft::{
-    BasicNode, ChangeMembers, Config, Entry, EntryPayload, LogId, ReadPolicy, SnapshotMeta,
-    StoredMembership, Vote,
+    BasicNode, ChangeMembers, Config, EntryPayload, ReadPolicy, SnapshotMeta, StoredMembership,
 };
 use rocksdb::{DB, Options};
 use std::collections::{BTreeMap, BTreeSet};
@@ -52,16 +52,16 @@ const REPAIR_CONCURRENCY: usize = 4;
 
 #[derive(Debug, Clone)]
 struct MetaSnapshot {
-    meta: SnapshotMeta<MetaTypeConfig>,
+    meta: SnapshotMetaOf<MetaTypeConfig>,
     data: Vec<u8>,
 }
 
 pub struct MetaStore {
     db: Arc<DB>,
-    vote: RwLock<Option<Vote<MetaTypeConfig>>>,
-    committed: RwLock<Option<LogId<MetaTypeConfig>>>,
-    last_purged: RwLock<Option<LogId<MetaTypeConfig>>>,
-    log: RwLock<BTreeMap<u64, Entry<MetaTypeConfig>>>,
+    vote: RwLock<Option<VoteOf<MetaTypeConfig>>>,
+    committed: RwLock<Option<LogIdOf<MetaTypeConfig>>>,
+    last_purged: RwLock<Option<LogIdOf<MetaTypeConfig>>>,
+    log: RwLock<BTreeMap<u64, EntryOf<MetaTypeConfig>>>,
     state_machine: RwLock<MetadataStateMachine>,
     current_snapshot: RwLock<Option<MetaSnapshot>>,
 }
@@ -75,7 +75,7 @@ impl MetaStore {
         let vote = load_json(&db, VOTE_KEY)?;
         let committed = load_json(&db, COMMITTED_KEY)?;
         let last_purged = load_json(&db, LAST_PURGED_KEY)?;
-        let snapshot_meta: Option<SnapshotMeta<MetaTypeConfig>> =
+        let snapshot_meta: Option<SnapshotMetaOf<MetaTypeConfig>> =
             load_json(&db, SNAPSHOT_META_KEY)?;
         let snapshot_data: Option<Vec<u8>> = load_json(&db, SNAPSHOT_DATA_KEY)?;
 
@@ -98,7 +98,7 @@ impl MetaStore {
             if !key.starts_with(LOG_PREFIX) {
                 continue;
             }
-            let entry: Entry<MetaTypeConfig> = serde_json::from_slice(&value)?;
+            let entry: EntryOf<MetaTypeConfig> = serde_json::from_slice(&value)?;
             log.insert(entry.index(), entry);
         }
 
@@ -134,18 +134,18 @@ impl RaftLogReader<MetaTypeConfig> for Arc<MetaStore> {
     async fn try_get_log_entries<RB: RangeBounds<u64> + Clone + Debug + openraft::OptionalSend>(
         &mut self,
         range: RB,
-    ) -> io::Result<Vec<Entry<MetaTypeConfig>>> {
+    ) -> io::Result<Vec<EntryOf<MetaTypeConfig>>> {
         let log = self.log.read().await;
         Ok(log.range(range).map(|(_, entry)| entry.clone()).collect())
     }
 
-    async fn read_vote(&mut self) -> io::Result<Option<Vote<MetaTypeConfig>>> {
+    async fn read_vote(&mut self) -> io::Result<Option<VoteOf<MetaTypeConfig>>> {
         Ok(*self.vote.read().await)
     }
 }
 
 impl RaftSnapshotBuilder<MetaTypeConfig> for Arc<MetaStore> {
-    async fn build_snapshot(&mut self) -> io::Result<Snapshot<MetaTypeConfig>> {
+    async fn build_snapshot(&mut self) -> io::Result<SnapshotOf<MetaTypeConfig>> {
         let state = self.state_machine.read().await.clone();
         let data = serde_json::to_vec(&state)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
@@ -197,23 +197,26 @@ impl RaftLogStorage<MetaTypeConfig> for Arc<MetaStore> {
         self.clone()
     }
 
-    async fn save_vote(&mut self, vote: &Vote<MetaTypeConfig>) -> io::Result<()> {
+    async fn save_vote(&mut self, vote: &VoteOf<MetaTypeConfig>) -> io::Result<()> {
         *self.vote.write().await = Some(*vote);
         put_json(&self.db, VOTE_KEY, vote)
     }
 
-    async fn save_committed(&mut self, committed: Option<LogId<MetaTypeConfig>>) -> io::Result<()> {
+    async fn save_committed(
+        &mut self,
+        committed: Option<LogIdOf<MetaTypeConfig>>,
+    ) -> io::Result<()> {
         *self.committed.write().await = committed;
         put_json(&self.db, COMMITTED_KEY, &committed)
     }
 
-    async fn read_committed(&mut self) -> io::Result<Option<LogId<MetaTypeConfig>>> {
+    async fn read_committed(&mut self) -> io::Result<Option<LogIdOf<MetaTypeConfig>>> {
         Ok(*self.committed.read().await)
     }
 
     async fn append<I>(&mut self, entries: I, callback: IOFlushed<MetaTypeConfig>) -> io::Result<()>
     where
-        I: IntoIterator<Item = Entry<MetaTypeConfig>> + openraft::OptionalSend,
+        I: IntoIterator<Item = EntryOf<MetaTypeConfig>> + openraft::OptionalSend,
         I::IntoIter: openraft::OptionalSend,
     {
         let mut log_guard = self.log.write().await;
@@ -231,7 +234,7 @@ impl RaftLogStorage<MetaTypeConfig> for Arc<MetaStore> {
 
     async fn truncate_after(
         &mut self,
-        last_log_id: Option<LogId<MetaTypeConfig>>,
+        last_log_id: Option<LogIdOf<MetaTypeConfig>>,
     ) -> io::Result<()> {
         let start_index = last_log_id.map(|log_id| log_id.index() + 1).unwrap_or(0);
         let mut log_guard = self.log.write().await;
@@ -248,7 +251,7 @@ impl RaftLogStorage<MetaTypeConfig> for Arc<MetaStore> {
         Ok(())
     }
 
-    async fn purge(&mut self, log_id: LogId<MetaTypeConfig>) -> io::Result<()> {
+    async fn purge(&mut self, log_id: LogIdOf<MetaTypeConfig>) -> io::Result<()> {
         *self.last_purged.write().await = Some(log_id);
         put_json(&self.db, LAST_PURGED_KEY, &Some(log_id))?;
 
@@ -273,8 +276,8 @@ impl RaftStateMachine<MetaTypeConfig> for Arc<MetaStore> {
     async fn applied_state(
         &mut self,
     ) -> io::Result<(
-        Option<LogId<MetaTypeConfig>>,
-        StoredMembership<MetaTypeConfig>,
+        Option<LogIdOf<MetaTypeConfig>>,
+        StoredMembershipOf<MetaTypeConfig>,
     )> {
         let state = self.state_machine.read().await;
         Ok((state.last_applied_log, state.last_membership.clone()))
@@ -322,7 +325,7 @@ impl RaftStateMachine<MetaTypeConfig> for Arc<MetaStore> {
 
     async fn install_snapshot(
         &mut self,
-        meta: &SnapshotMeta<MetaTypeConfig>,
+        meta: &SnapshotMetaOf<MetaTypeConfig>,
         snapshot: Cursor<Vec<u8>>,
     ) -> io::Result<()> {
         let data = snapshot.into_inner();
@@ -340,7 +343,7 @@ impl RaftStateMachine<MetaTypeConfig> for Arc<MetaStore> {
         Ok(())
     }
 
-    async fn get_current_snapshot(&mut self) -> io::Result<Option<Snapshot<MetaTypeConfig>>> {
+    async fn get_current_snapshot(&mut self) -> io::Result<Option<SnapshotOf<MetaTypeConfig>>> {
         Ok(self
             .current_snapshot
             .read()
@@ -565,7 +568,7 @@ impl MetadataNode {
     /// leader lease.
     async fn membership_view(
         &self,
-    ) -> Result<(StoredMembership<MetaTypeConfig>, BTreeSet<MetaNodeId>), Status> {
+    ) -> Result<(StoredMembershipOf<MetaTypeConfig>, BTreeSet<MetaNodeId>), Status> {
         self.with_linearized_state(|state| {
             (
                 state.last_membership.clone(),
@@ -1098,8 +1101,8 @@ impl RaftNetworkV2<MetaTypeConfig> for MetaNetworkClient {
 
     async fn full_snapshot(
         &mut self,
-        vote: Vote<MetaTypeConfig>,
-        snapshot: Snapshot<MetaTypeConfig>,
+        vote: VoteOf<MetaTypeConfig>,
+        snapshot: SnapshotOf<MetaTypeConfig>,
         _cancel: impl std::future::Future<Output = openraft::error::ReplicationClosed>
         + openraft::OptionalSend
         + 'static,
@@ -1132,8 +1135,10 @@ impl RaftNetworkV2<MetaTypeConfig> for MetaNetworkClient {
             .map_err(|e| openraft::error::StreamingError::Network(NetworkError::new(&e)))?
     }
 
-    fn backoff(&self) -> openraft::network::Backoff {
-        openraft::network::Backoff::new(std::iter::repeat(Duration::from_millis(250)))
+    fn backoff(&self) -> Option<openraft::network::Backoff> {
+        Some(openraft::network::Backoff::new(std::iter::repeat(
+            Duration::from_millis(250),
+        )))
     }
 }
 

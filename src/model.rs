@@ -2,7 +2,8 @@ use crate::path::{basename, normalize_path, parent_path};
 use crate::pb;
 use crate::raft::MetaTypeConfig;
 use anyhow::{Result, bail};
-use openraft::{LogId, StoredMembership};
+use openraft::StoredMembership;
+use openraft::alias::{LogIdOf, StoredMembershipOf};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -263,8 +264,8 @@ impl NamespaceEntry {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MetadataStateMachine {
-    pub last_applied_log: Option<LogId<MetaTypeConfig>>,
-    pub last_membership: StoredMembership<MetaTypeConfig>,
+    pub last_applied_log: Option<LogIdOf<MetaTypeConfig>>,
+    pub last_membership: StoredMembershipOf<MetaTypeConfig>,
     pub next_inode: u64,
     pub entries: BTreeMap<String, NamespaceEntry>,
     pub upload_sessions: BTreeMap<String, UploadSessionState>,
