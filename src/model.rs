@@ -11,6 +11,8 @@ use std::collections::BTreeMap;
 pub enum UploadModeModel {
     Create,
     Overwrite,
+    Append,
+    ReplaceRange,
 }
 
 impl TryFrom<i32> for UploadModeModel {
@@ -20,6 +22,8 @@ impl TryFrom<i32> for UploadModeModel {
         match pb::UploadMode::try_from(value) {
             Ok(pb::UploadMode::Create) => Ok(Self::Create),
             Ok(pb::UploadMode::Overwrite) => Ok(Self::Overwrite),
+            Ok(pb::UploadMode::Append) => Ok(Self::Append),
+            Ok(pb::UploadMode::ReplaceRange) => Ok(Self::ReplaceRange),
             _ => bail!("unsupported upload mode"),
         }
     }
@@ -365,6 +369,12 @@ pub enum MetadataCommand {
     CommitUpload {
         upload_id: String,
         chunks: Vec<CommitChunkModel>,
+        /// Byte range of the existing file replaced by this commit; only
+        /// read for `ReplaceRange` sessions.
+        #[serde(default)]
+        replace_from: u64,
+        #[serde(default)]
+        replace_len: u64,
         now_ms: u64,
         gc_grace_ms: u64,
     },

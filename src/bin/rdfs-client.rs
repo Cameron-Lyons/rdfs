@@ -8,7 +8,7 @@ async fn main() -> anyhow::Result<()> {
     if args.len() < 3 {
         eprintln!("usage: rdfs-client <meta1,meta2,...> <command> [args]");
         eprintln!(
-            "commands: demo | mkdir <path> | ls <path> | put <path> <text> | cat <path> | rm <path> | stat <path> | meta-membership | meta-add <id> <addr> [--voter] | meta-rm <id> [--retain] | meta-replace <old_id> <new_id> <new_addr>"
+            "commands: demo | mkdir <path> | ls <path> | put <path> <text> | append <path> <text> | write-at <path> <offset> <text> | cat <path> | rm <path> | stat <path> | meta-membership | meta-add <id> <addr> [--voter] | meta-rm <id> [--retain] | meta-replace <old_id> <new_id> <new_addr>"
         );
         std::process::exit(1);
     }
@@ -55,6 +55,19 @@ async fn main() -> anyhow::Result<()> {
             };
             writer.write(body.as_bytes()).await?;
             writer.commit().await?;
+        }
+        "append" => {
+            let path = args.get(3).expect("missing path");
+            let body = args.get(4).expect("missing text");
+            let mut writer = client.append_writer(path, WriteOptions::default()).await?;
+            writer.write(body.as_bytes()).await?;
+            writer.commit().await?;
+        }
+        "write-at" => {
+            let path = args.get(3).expect("missing path");
+            let offset = args.get(4).expect("missing offset").parse::<u64>()?;
+            let body = args.get(5).expect("missing text");
+            client.write_at(path, offset, body.as_bytes()).await?;
         }
         "cat" => {
             let reader = client

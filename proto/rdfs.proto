@@ -41,6 +41,11 @@ enum UploadMode {
   UPLOAD_MODE_UNSPECIFIED = 0;
   UPLOAD_MODE_CREATE = 1;
   UPLOAD_MODE_OVERWRITE = 2;
+  // Commits are appended after the file's existing chunks.
+  UPLOAD_MODE_APPEND = 3;
+  // Commits replace the byte range given by replace_from/replace_len in
+  // CommitUploadRequest. The range must cover whole existing chunks.
+  UPLOAD_MODE_REPLACE_RANGE = 4;
 }
 
 message UploadSession {
@@ -109,6 +114,10 @@ message AllocateChunkRequest {
 message CommitUploadRequest {
   string upload_id = 1;
   repeated CommitChunk chunks = 2;
+  // Byte range of the existing file replaced by this commit. Only read for
+  // UPLOAD_MODE_REPLACE_RANGE sessions.
+  uint64 replace_from = 3;
+  uint64 replace_len = 4;
 }
 
 message ReportReplicaFailureRequest {

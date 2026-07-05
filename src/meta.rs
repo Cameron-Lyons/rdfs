@@ -877,6 +877,8 @@ impl pb::metadata_service_server::MetadataService for MetadataGrpc {
             .write_command(MetadataCommand::CommitUpload {
                 upload_id: request.upload_id,
                 chunks,
+                replace_from: request.replace_from,
+                replace_len: request.replace_len,
                 now_ms: now_millis(),
                 gc_grace_ms: GC_GRACE_MS,
             })
@@ -1372,9 +1374,21 @@ fn apply_command(
         MetadataCommand::CommitUpload {
             upload_id,
             chunks,
+            replace_from,
+            replace_len,
             now_ms,
             gc_grace_ms,
-        } => apply_commit_upload(state, &upload_id, chunks, now_ms, gc_grace_ms),
+        } => apply_commit_upload(
+            state,
+            &upload_id,
+            CommitUploadArgs {
+                chunks,
+                replace_from,
+                replace_len,
+                now_ms,
+                gc_grace_ms,
+            },
+        ),
         MetadataCommand::Heartbeat {
             node_id,
             addr,
@@ -1509,13 +1523,30 @@ fn apply_begin_upload(
         bail!("path already has an active upload");
     }
 
+    let existing_file = match state.entries.get(&path) {
+        Some(NamespaceEntry::File(file)) => Some(file),
+        Some(_) => None,
+        None => None,
+    };
     match (mode, state.entries.get(&path)) {
         (UploadModeModel::Create, None) => {}
         (UploadModeModel::Create, Some(_)) => bail!("path already exists"),
-        (UploadModeModel::Overwrite, Some(NamespaceEntry::File(_))) => {}
-        (UploadModeModel::Overwrite, Some(_)) => bail!("path is not a file"),
-        (UploadModeModel::Overwrite, None) => bail!("file does not exist"),
+        (
+            UploadModeModel::Overwrite | UploadModeModel::Append | UploadModeModel::ReplaceRange,
+            Some(NamespaceEntry::File(_)),
+        ) => {}
+        (_, Some(_)) => bail!("path is not a file"),
+        (_, None) => bail!("file does not exist"),
     }
+
+    // Appends and range replacements extend an existing manifest, so their
+    // chunks keep the file's original chunk size rather than the caller's.
+    let chunk_size = match (mode, existing_file) {
+        (UploadModeModel::Append | UploadModeModel::ReplaceRange, Some(file)) => {
+            file.info.chunk_size
+        }
+        _ => chunk_size,
+    };
 
     let session = UploadSessionState {
         upload_id,
@@ -1581,13 +1612,26 @@ fn apply_allocate_chunk(
     }))
 }
 
+struct CommitUploadArgs {
+    chunks: Vec<CommitChunkModel>,
+    replace_from: u64,
+    replace_len: u64,
+    now_ms: u64,
+    gc_grace_ms: u64,
+}
+
 fn apply_commit_upload(
     state: &mut MetadataStateMachine,
     upload_id: &str,
-    chunks: Vec<CommitChunkModel>,
-    now_ms: u64,
-    gc_grace_ms: u64,
+    args: CommitUploadArgs,
 ) -> Result<MetadataResponse> {
+    let CommitUploadArgs {
+        chunks,
+        replace_from,
+        replace_len,
+        now_ms,
+        gc_grace_ms,
+    } = args;
     let session = state
         .upload_sessions
         .get(upload_id)
@@ -1601,8 +1645,10 @@ fn apply_commit_upload(
     let mut chunks = chunks;
     chunks.sort_by_key(|chunk| chunk.offset);
 
+    // Committed offsets are session-relative: contiguous from zero. Where
+    // they land in the file depends on the session mode.
     let mut next_offset = 0u64;
-    let mut manifest_chunks = Vec::with_capacity(chunks.len());
+    let mut new_chunks = Vec::with_capacity(chunks.len());
     for chunk in &chunks {
         if chunk.offset != next_offset {
             bail!("chunks must be contiguous from offset 0");
@@ -1630,7 +1676,7 @@ fn apply_commit_upload(
             );
         }
 
-        manifest_chunks.push(crate::model::ChunkRefModel {
+        new_chunks.push(crate::model::ChunkRefModel {
             chunk_id: chunk.chunk_id.clone(),
             offset: chunk.offset,
             size: chunk.size,
@@ -1645,14 +1691,75 @@ fn apply_commit_upload(
         });
         next_offset += chunk.size;
     }
+    let new_len = next_offset;
 
-    let old_chunks = state
+    let old_file = state
         .entries
         .get(&session.path)
         .and_then(|entry| match entry {
-            NamespaceEntry::File(file) => Some(file.chunks.clone()),
+            NamespaceEntry::File(file) => Some(file.clone()),
             _ => None,
         });
+    if !matches!(session.mode, UploadModeModel::Create) && old_file.is_none() {
+        bail!("file does not exist");
+    }
+    let old_size = old_file.as_ref().map(|file| file.info.size).unwrap_or(0);
+
+    // Splice the new chunks into the manifest: the byte range
+    // [splice_from, splice_from + spliced_len) of the old file is replaced.
+    let (splice_from, spliced_len) = match session.mode {
+        UploadModeModel::Create | UploadModeModel::Overwrite => (0, old_size),
+        UploadModeModel::Append => (old_size, 0),
+        UploadModeModel::ReplaceRange => {
+            if replace_from.saturating_add(replace_len) > old_size {
+                bail!("replaced range extends past end of file");
+            }
+            (replace_from, replace_len)
+        }
+    };
+    let splice_to = splice_from + spliced_len;
+    // Anything after the replaced range keeps its offset, so a replacement
+    // that is not at the tail must preserve the range's length exactly.
+    if splice_to < old_size && new_len != spliced_len {
+        bail!("range replacement must preserve length except at end of file");
+    }
+
+    let old_chunks = old_file.map(|file| file.chunks).unwrap_or_default();
+    let prefix_end = old_chunks
+        .iter()
+        .position(|chunk| chunk.offset >= splice_from)
+        .unwrap_or(old_chunks.len());
+    if old_chunks
+        .get(prefix_end)
+        .is_some_and(|chunk| chunk.offset != splice_from)
+        || old_chunks
+            .get(prefix_end.saturating_sub(1))
+            .is_some_and(|chunk| prefix_end > 0 && chunk.offset + chunk.size > splice_from)
+    {
+        bail!("replaced range must start on a chunk boundary");
+    }
+    let mut suffix_start = prefix_end;
+    let mut covered = 0u64;
+    while covered < spliced_len {
+        let Some(chunk) = old_chunks.get(suffix_start) else {
+            bail!("replaced range must cover whole chunks");
+        };
+        covered += chunk.size;
+        suffix_start += 1;
+    }
+    if covered != spliced_len {
+        bail!("replaced range must end on a chunk boundary");
+    }
+
+    let mut manifest_chunks = Vec::with_capacity(old_chunks.len() + new_chunks.len());
+    manifest_chunks.extend_from_slice(&old_chunks[..prefix_end]);
+    for chunk in &new_chunks {
+        let mut chunk = chunk.clone();
+        chunk.offset += splice_from;
+        manifest_chunks.push(chunk);
+    }
+    manifest_chunks.extend_from_slice(&old_chunks[suffix_start..]);
+    let replaced_chunks = old_chunks[prefix_end..suffix_start].to_vec();
 
     let inode = state
         .entries
@@ -1663,7 +1770,7 @@ fn apply_commit_upload(
     let info = FileInfoModel {
         inode,
         path: session.path.clone(),
-        size: next_offset,
+        size: old_size - spliced_len + new_len,
         chunk_size: session.chunk_size,
         is_dir: false,
     };
@@ -1672,7 +1779,7 @@ fn apply_commit_upload(
         chunks: manifest_chunks.clone(),
     };
 
-    for chunk in &manifest_chunks {
+    for chunk in &new_chunks {
         match state.chunk_records.get_mut(&chunk.chunk_id) {
             Some(record) => {
                 record.ref_count += 1;
@@ -1693,9 +1800,7 @@ fn apply_commit_upload(
         }
     }
 
-    if let Some(old_chunks) = old_chunks {
-        release_manifest_chunks(state, &old_chunks, now_ms, gc_grace_ms);
-    }
+    release_manifest_chunks(state, &replaced_chunks, now_ms, gc_grace_ms);
 
     state.entries.insert(
         session.path.clone(),
