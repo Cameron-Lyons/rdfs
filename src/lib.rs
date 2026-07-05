@@ -3,6 +3,7 @@ pub mod client;
 pub mod local;
 pub mod meta;
 pub mod model;
+pub mod net;
 pub mod path;
 pub mod pb;
 pub mod raft;
