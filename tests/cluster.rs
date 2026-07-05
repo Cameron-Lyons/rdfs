@@ -1,3 +1,4 @@
+use futures_util::TryStreamExt;
 use rdfs::chunk::{ChunkServer, ChunkServerConfig};
 use rdfs::client::{Client, WriteOptions};
 use rdfs::meta::{MetadataNode, MetadataNodeConfig};
@@ -224,6 +225,29 @@ async fn large_multi_chunk_files_round_trip() -> anyhow::Result<()> {
 
     let reader = client.open_reader("/big/blob.bin").await?;
     assert_eq!(reader.read_all().await?, expected);
+
+    // Streaming yields the same bytes chunk by chunk.
+    let mut streamed = Vec::new();
+    let mut chunks = std::pin::pin!(reader.stream());
+    while let Some(chunk) = chunks.try_next().await? {
+        streamed.extend_from_slice(&chunk);
+    }
+    assert_eq!(streamed, expected);
+
+    // Range reads: within one chunk, across the chunk boundary, and past
+    // the end of the file.
+    let chunk_size = 8 * 1024 * 1024u64;
+    assert_eq!(reader.read_range(5, 100).await?, expected[5..105]);
+    assert_eq!(
+        reader.read_range(chunk_size - 10, 20).await?,
+        expected[(chunk_size - 10) as usize..(chunk_size + 10) as usize]
+    );
+    let tail_offset = expected.len() as u64 - 7;
+    assert_eq!(
+        reader.read_range(tail_offset, 1000).await?,
+        expected[tail_offset as usize..]
+    );
+    assert_eq!(reader.read_range(expected.len() as u64 + 1, 10).await?, b"");
 
     cluster.stop().await;
     Ok(())

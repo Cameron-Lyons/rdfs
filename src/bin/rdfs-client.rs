@@ -1,4 +1,6 @@
+use futures_util::TryStreamExt;
 use rdfs::client::{Client, WriteOptions};
+use tokio::io::AsyncWriteExt;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -58,7 +60,12 @@ async fn main() -> anyhow::Result<()> {
             let reader = client
                 .open_reader(args.get(3).expect("missing path"))
                 .await?;
-            println!("{}", String::from_utf8_lossy(&reader.read_all().await?));
+            let mut stdout = tokio::io::stdout();
+            let mut chunks = std::pin::pin!(reader.stream());
+            while let Some(chunk) = chunks.try_next().await? {
+                stdout.write_all(&chunk).await?;
+            }
+            stdout.flush().await?;
         }
         "rm" => {
             client.delete(args.get(3).expect("missing path")).await?;
