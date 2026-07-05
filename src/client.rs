@@ -4,10 +4,12 @@ use crate::pb;
 use crate::util::checksum_hex;
 use anyhow::{Result, bail};
 use futures_util::{StreamExt, TryStreamExt, stream};
+use std::collections::VecDeque;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use tokio::sync::RwLock;
+use tokio::task::JoinHandle;
 use tonic::Status;
 use tonic::transport::Channel;
 
@@ -17,6 +19,9 @@ type MetadataFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, Status>> + Se
 
 /// How many chunks a reader fetches concurrently.
 const READ_AHEAD_CHUNKS: usize = 4;
+
+/// How many chunks a writer uploads concurrently.
+const WRITE_PIPELINE_CHUNKS: usize = 4;
 
 #[derive(Debug, Clone)]
 pub struct WriteOptions {
@@ -254,6 +259,7 @@ impl Client {
             client: self.clone(),
             session,
             buffer: Vec::new(),
+            inflight: VecDeque::new(),
             chunks: Vec::new(),
             offset: 0,
         })
@@ -356,6 +362,10 @@ pub struct FileWriter {
     client: Client,
     session: pb::UploadSession,
     buffer: Vec<u8>,
+    /// Uploads still in flight, oldest first, at most
+    /// [`WRITE_PIPELINE_CHUNKS`] deep. Completions are collected in order so
+    /// `chunks` stays sorted by offset.
+    inflight: VecDeque<JoinHandle<Result<pb::CommitChunk>>>,
     chunks: Vec<pb::CommitChunk>,
     offset: u64,
 }
@@ -365,8 +375,9 @@ impl FileWriter {
         self.buffer.extend_from_slice(data);
         let chunk_size = self.session.chunk_size as usize;
         while self.buffer.len() >= chunk_size {
-            let chunk = self.buffer.drain(..chunk_size).collect::<Vec<_>>();
-            self.flush_chunk(chunk).await?;
+            let rest = self.buffer.split_off(chunk_size);
+            let chunk = std::mem::replace(&mut self.buffer, rest);
+            self.spawn_flush(chunk).await?;
         }
         Ok(())
     }
@@ -374,8 +385,9 @@ impl FileWriter {
     pub async fn commit(mut self) -> Result<pb::FileManifest> {
         if !self.buffer.is_empty() {
             let tail = std::mem::take(&mut self.buffer);
-            self.flush_chunk(tail).await?;
+            self.spawn_flush(tail).await?;
         }
+        while self.collect_oldest().await? {}
 
         let request = pb::CommitUploadRequest {
             upload_id: self.session.upload_id.clone(),
@@ -391,48 +403,81 @@ impl FileWriter {
         Ok(manifest)
     }
 
-    async fn flush_chunk(&mut self, data: Vec<u8>) -> Result<()> {
-        let checksum = checksum_hex(&data);
+    /// Starts uploading one chunk in the background, first draining the
+    /// oldest in-flight upload when the pipeline is full.
+    async fn spawn_flush(&mut self, data: Vec<u8>) -> Result<()> {
+        while self.inflight.len() >= WRITE_PIPELINE_CHUNKS {
+            self.collect_oldest().await?;
+        }
+        let client = self.client.clone();
         let upload_id = self.session.upload_id.clone();
-        let placement = self
-            .client
-            .call_metadata(|client| {
-                let request = pb::AllocateChunkRequest {
-                    upload_id: upload_id.clone(),
-                    size: data.len() as u64,
-                    checksum: checksum.clone(),
-                };
-                Box::pin(
-                    async move { client.allocate_chunk(request).await.map(|r| r.into_inner()) },
-                )
-            })
-            .await?;
-        let primary = placement
-            .replicas
-            .first()
-            .cloned()
-            .ok_or_else(|| anyhow::anyhow!("metadata returned no chunk replicas"))?;
-
-        let size = data.len() as u64;
-        let header = pb::PutChunkHeader {
-            chunk_id: placement.chunk_id.clone(),
-            checksum: checksum.clone(),
-            size,
-            forward_targets: placement.replicas.iter().skip(1).cloned().collect(),
-        };
-        let channel = self.client.channels.get(&primary.addr)?;
-        send_chunk(channel, header, data).await?;
-
-        self.chunks.push(pb::CommitChunk {
-            chunk_id: placement.chunk_id,
-            offset: self.offset,
-            size,
-            checksum,
-            replicas: placement.replicas,
-        });
-        self.offset += size;
+        let offset = self.offset;
+        self.offset += data.len() as u64;
+        self.inflight
+            .push_back(tokio::spawn(upload_chunk(client, upload_id, offset, data)));
         Ok(())
     }
+
+    /// Waits for the oldest in-flight upload and records its chunk. Returns
+    /// false when nothing is in flight.
+    async fn collect_oldest(&mut self) -> Result<bool> {
+        let Some(task) = self.inflight.pop_front() else {
+            return Ok(false);
+        };
+        self.chunks.push(task.await??);
+        Ok(true)
+    }
+}
+
+impl Drop for FileWriter {
+    fn drop(&mut self) {
+        for task in &self.inflight {
+            task.abort();
+        }
+    }
+}
+
+/// Allocates placement for one chunk and replicates it through the primary.
+async fn upload_chunk(
+    client: Client,
+    upload_id: String,
+    offset: u64,
+    data: Vec<u8>,
+) -> Result<pb::CommitChunk> {
+    let checksum = checksum_hex(&data);
+    let placement = client
+        .call_metadata(|client| {
+            let request = pb::AllocateChunkRequest {
+                upload_id: upload_id.clone(),
+                size: data.len() as u64,
+                checksum: checksum.clone(),
+            };
+            Box::pin(async move { client.allocate_chunk(request).await.map(|r| r.into_inner()) })
+        })
+        .await?;
+    let primary = placement
+        .replicas
+        .first()
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("metadata returned no chunk replicas"))?;
+
+    let size = data.len() as u64;
+    let header = pb::PutChunkHeader {
+        chunk_id: placement.chunk_id.clone(),
+        checksum: checksum.clone(),
+        size,
+        forward_targets: placement.replicas.iter().skip(1).cloned().collect(),
+    };
+    let channel = client.channels.get(&primary.addr)?;
+    send_chunk(channel, header, data).await?;
+
+    Ok(pb::CommitChunk {
+        chunk_id: placement.chunk_id,
+        offset,
+        size,
+        checksum,
+        replicas: placement.replicas,
+    })
 }
 
 pub struct FileReader {
