@@ -356,13 +356,19 @@ pub async fn send_chunk(
     let header_message = pb::PutChunkRequest {
         item: Some(pb::put_chunk_request::Item::Header(header)),
     };
-    let frames = data
-        .chunks(TRANSFER_FRAME_SIZE)
-        .map(|frame| pb::PutChunkRequest {
-            item: Some(pb::put_chunk_request::Item::Data(frame.to_vec())),
-        })
-        .collect::<Vec<_>>();
-    let request = stream::iter(std::iter::once(header_message).chain(frames));
+    // Frames are cut from the chunk lazily so only one frame is duplicated
+    // at a time instead of a second copy of the whole chunk.
+    let frames = stream::unfold((data, 0usize), |(data, start)| async move {
+        if start >= data.len() {
+            return None;
+        }
+        let end = data.len().min(start + TRANSFER_FRAME_SIZE);
+        let frame = pb::PutChunkRequest {
+            item: Some(pb::put_chunk_request::Item::Data(data[start..end].to_vec())),
+        };
+        Some((frame, (data, end)))
+    });
+    let request = stream::once(async move { header_message }).chain(frames);
     let response = client.put_chunk(request).await?;
     Ok(response.into_inner())
 }
