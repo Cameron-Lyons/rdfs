@@ -601,6 +601,11 @@ struct GetChunkState {
 
 async fn heartbeat_loop(server: ChunkServer) {
     let mut leader_hint = None::<String>;
+    // The `(leader addr, digest)` pair acknowledged by the last successful
+    // heartbeat. While it matches, heartbeats carry liveness only; the full
+    // inventory is sent when it changes, when the leader moves, or when the
+    // leader asks for a resend.
+    let mut acked = None::<(String, String)>;
     let mut interval = tokio::time::interval(Duration::from_secs(2));
     let mut shutdown = server.inner.shutdown.subscribe();
 
@@ -609,67 +614,93 @@ async fn heartbeat_loop(server: ChunkServer) {
             _ = shutdown.changed() => break,
             _ = interval.tick() => {}
         }
-        let inventory = server
-            .inner
-            .store
-            .inventory()
-            .await
-            .into_iter()
-            .map(|chunk| pb::InventoryChunk {
-                chunk_id: chunk.chunk_id,
-                checksum: chunk.checksum,
-                size: chunk.size,
-            })
-            .collect();
-        let request = pb::HeartbeatRequest {
-            node_id: server.inner.node_id.clone(),
-            addr: server.inner.addr.clone(),
-            capacity: server.inner.capacity,
-            used: server.inner.store.used(),
-            inventory,
-        };
+        let inventory = server.inner.store.inventory().await;
+        let digest = inventory_digest(&inventory);
 
-        if let Some(addr) = leader_hint.clone()
-            && send_heartbeat(&server, &addr, request.clone())
-                .await
-                .is_ok()
-        {
-            continue;
+        let mut targets = Vec::new();
+        if let Some(leader) = leader_hint.clone() {
+            targets.push(leader);
+        }
+        for addr in &server.inner.metadata_addrs {
+            if !targets.contains(addr) {
+                targets.push(addr.clone());
+            }
         }
 
-        leader_hint = None;
-        for addr in &server.inner.metadata_addrs {
-            match send_heartbeat(&server, addr, request.clone()).await {
-                Ok(Some(leader)) => leader_hint = Some(leader),
-                Ok(None) => {
+        let mut delivered = false;
+        for addr in targets {
+            let include_inventory = acked.as_ref() != Some(&(addr.clone(), digest.clone()));
+            let request = pb::HeartbeatRequest {
+                node_id: server.inner.node_id.clone(),
+                addr: server.inner.addr.clone(),
+                capacity: server.inner.capacity,
+                used: server.inner.store.used(),
+                inventory: if include_inventory {
+                    inventory
+                        .iter()
+                        .map(|chunk| pb::InventoryChunk {
+                            chunk_id: chunk.chunk_id.clone(),
+                            checksum: chunk.checksum.clone(),
+                            size: chunk.size,
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                },
+                inventory_digest: digest.clone(),
+                has_inventory: include_inventory,
+            };
+
+            match send_heartbeat(&server, &addr, request).await {
+                Ok(response) => {
                     leader_hint = Some(addr.clone());
+                    acked = if response.resend_inventory {
+                        None
+                    } else {
+                        Some((addr, digest.clone()))
+                    };
+                    delivered = true;
                     break;
                 }
-                Err(err) => {
-                    if let Some(leader) = status_leader_hint(&err) {
+                Err(status) => {
+                    if let Some(leader) = status_leader_hint(&status) {
                         leader_hint = Some(leader);
                     }
                 }
             }
         }
+        if !delivered {
+            leader_hint = None;
+        }
     }
+}
+
+/// Digest of a chunkserver's full inventory, stable across heartbeats as
+/// long as the set of stored chunks is unchanged.
+fn inventory_digest(inventory: &[ChunkInventoryEntry]) -> String {
+    let mut hasher = Sha256::new();
+    for chunk in inventory {
+        hasher.update(chunk.chunk_id.as_bytes());
+        hasher.update([0]);
+        hasher.update(chunk.checksum.as_bytes());
+        hasher.update([0]);
+        hasher.update(chunk.size.to_le_bytes());
+    }
+    digest_hex(hasher)
 }
 
 async fn send_heartbeat(
     server: &ChunkServer,
     addr: &str,
     request: pb::HeartbeatRequest,
-) -> Result<Option<String>, Status> {
+) -> Result<pb::HeartbeatResponse, Status> {
     let channel = server
         .inner
         .channels
         .get(addr)
         .map_err(|e| Status::unavailable(e.to_string()))?;
     let mut client = pb::metadata_service_client::MetadataServiceClient::new(channel);
-    match client.heartbeat(request).await {
-        Ok(_) => Ok(None),
-        Err(status) => Err(status),
-    }
+    Ok(client.heartbeat(request).await?.into_inner())
 }
 
 fn status_leader_hint(status: &Status) -> Option<String> {

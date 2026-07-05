@@ -122,7 +122,19 @@ message HeartbeatRequest {
   string addr = 2;
   uint64 capacity = 3;
   uint64 used = 4;
+  // Full inventory, only populated when has_inventory is set. Chunkservers
+  // send it on the first heartbeat to a leader, when it changes, or when the
+  // leader requests a resend; liveness-only heartbeats omit it.
   repeated InventoryChunk inventory = 5;
+  string inventory_digest = 6;
+  bool has_inventory = 7;
+}
+
+message HeartbeatResponse {
+  // Set when the leader's recorded inventory digest does not match the
+  // reported one, asking the chunkserver to include its full inventory in
+  // the next heartbeat.
+  bool resend_inventory = 1;
 }
 
 message MetadataNodeInfo {
@@ -213,7 +225,7 @@ service MetadataService {
   rpc AllocateChunk(AllocateChunkRequest) returns (ChunkPlacement);
   rpc CommitUpload(CommitUploadRequest) returns (FileManifest);
   rpc ReportReplicaFailure(ReportReplicaFailureRequest) returns (Empty);
-  rpc Heartbeat(HeartbeatRequest) returns (Empty);
+  rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
   rpc GetClusterMembership(Empty) returns (ClusterMembership);
   rpc AddMetadataNode(AddMetadataNodeRequest) returns (ClusterMembership);
   rpc RemoveMetadataNode(RemoveMetadataNodeRequest) returns (ClusterMembership);

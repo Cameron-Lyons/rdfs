@@ -215,6 +215,10 @@ pub struct ChunkServerState {
     pub used: u64,
     pub last_heartbeat_unix_ms: u64,
     pub inventory: BTreeMap<String, ChunkInventoryEntry>,
+    /// Digest of the last full inventory this server reported, used to
+    /// detect when a liveness-only heartbeat is hiding a divergent inventory.
+    #[serde(default)]
+    pub inventory_digest: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -368,7 +372,10 @@ pub enum MetadataCommand {
         addr: String,
         capacity: u64,
         used: u64,
-        inventory: Vec<ChunkInventoryEntry>,
+        /// `None` for liveness-only heartbeats whose inventory is unchanged.
+        inventory: Option<Vec<ChunkInventoryEntry>>,
+        #[serde(default)]
+        inventory_digest: String,
         now_ms: u64,
     },
     ReportReplicaFailure {
@@ -424,6 +431,7 @@ impl TryFrom<pb::CommitChunk> for CommitChunkModel {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum MetadataResponse {
     Ack,
+    HeartbeatAck { resend_inventory: bool },
     FileInfo(FileInfoModel),
     FileManifest(FileManifestModel),
     UploadSession(UploadSessionModel),
