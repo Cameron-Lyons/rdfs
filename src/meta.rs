@@ -11,7 +11,7 @@ use crate::pb;
 use crate::raft::{MetaNodeId, MetaRaft, MetaTypeConfig};
 use crate::util::{checksum_hex, now_millis};
 use anyhow::{Result, bail};
-use futures_util::{Stream, TryStreamExt};
+use futures_util::{Stream, StreamExt, TryStreamExt, stream};
 use openraft::entry::RaftEntry;
 use openraft::error::{ForwardToLeader, NetworkError, RPCError, RaftError, Unreachable};
 use openraft::network::{RPCOption, RaftNetworkFactory, RaftNetworkV2};
@@ -46,6 +46,10 @@ const SNAPSHOT_DATA_KEY: &[u8] = b"snapshot_data";
 const ACTIVE_CHUNKSERVER_WINDOW_MS: u64 = 15_000;
 const LEASE_TTL_MS: u64 = 30_000;
 const GC_GRACE_MS: u64 = 30_000;
+/// How many tombstoned chunks the GC loop deletes concurrently.
+const GC_CONCURRENCY: usize = 8;
+/// How many chunks the repair loop re-replicates concurrently.
+const REPAIR_CONCURRENCY: usize = 4;
 
 #[derive(Debug, Clone)]
 struct MetaSnapshot {
@@ -896,17 +900,19 @@ impl pb::metadata_service_server::MetadataService for MetadataGrpc {
     async fn heartbeat(
         &self,
         request: Request<pb::HeartbeatRequest>,
-    ) -> Result<Response<pb::Empty>, Status> {
+    ) -> Result<Response<pb::HeartbeatResponse>, Status> {
         let request = request.into_inner();
-        let inventory = request
-            .inventory
-            .into_iter()
-            .map(|chunk| ChunkInventoryEntry {
-                chunk_id: chunk.chunk_id,
-                checksum: chunk.checksum,
-                size: chunk.size,
-            })
-            .collect();
+        let inventory = request.has_inventory.then(|| {
+            request
+                .inventory
+                .into_iter()
+                .map(|chunk| ChunkInventoryEntry {
+                    chunk_id: chunk.chunk_id,
+                    checksum: chunk.checksum,
+                    size: chunk.size,
+                })
+                .collect()
+        });
 
         let response = self
             .node
@@ -916,11 +922,17 @@ impl pb::metadata_service_server::MetadataService for MetadataGrpc {
                 capacity: request.capacity,
                 used: request.used,
                 inventory,
+                inventory_digest: request.inventory_digest,
                 now_ms: now_millis(),
             })
             .await?;
-        MetadataNode::response_as_ack(response)?;
-        Ok(Response::new(pb::Empty {}))
+        match response {
+            MetadataResponse::HeartbeatAck { resend_inventory } => {
+                Ok(Response::new(pb::HeartbeatResponse { resend_inventory }))
+            }
+            MetadataResponse::Error(error) => Err(Status::failed_precondition(error)),
+            other => Err(Status::internal(format!("unexpected response: {other:?}"))),
+        }
     }
 
     async fn get_cluster_membership(
@@ -1164,25 +1176,31 @@ async fn gc_loop(node: MetadataNode) {
             continue;
         }
 
-        let mut completed = Vec::new();
-        for tombstone in due {
-            let mut ok = true;
-            for replica in &tombstone.replicas {
-                let Some(addr) = state.chunk_server_addr(&replica.node_id) else {
-                    ok = false;
-                    continue;
-                };
-                if delete_chunk(&node.inner.channels, &addr, &tombstone.chunk_id)
-                    .await
-                    .is_err()
-                {
-                    ok = false;
+        let state = &state;
+        let node_ref = &node;
+        let completed = stream::iter(due)
+            .map(|tombstone| async move {
+                let mut ok = true;
+                for replica in &tombstone.replicas {
+                    let Some(addr) = state.chunk_server_addr(&replica.node_id) else {
+                        ok = false;
+                        continue;
+                    };
+                    if delete_chunk(&node_ref.inner.channels, &addr, &tombstone.chunk_id)
+                        .await
+                        .is_err()
+                    {
+                        ok = false;
+                    }
                 }
-            }
-            if ok {
-                completed.push(tombstone.chunk_id.clone());
-            }
-        }
+                ok.then_some(tombstone.chunk_id)
+            })
+            .buffer_unordered(GC_CONCURRENCY)
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
 
         if !completed.is_empty() {
             let _ = node
@@ -1218,47 +1236,59 @@ async fn repair_loop(node: MetadataNode) {
 
         let state = node.inner.store.state_snapshot().await;
         let repairs = state.repairs.values().cloned().collect::<Vec<_>>();
-        for repair in repairs {
-            let Some(record) = state.chunk_records.get(&repair.chunk_id) else {
-                continue;
-            };
-            let Some(bytes) = fetch_repair_source(&node.inner.channels, &state, record).await
-            else {
-                continue;
-            };
+        let state = &state;
+        let node_ref = &node;
+        stream::iter(repairs)
+            .map(|repair| async move { run_repair(node_ref, state, repair).await })
+            .buffer_unordered(REPAIR_CONCURRENCY)
+            .collect::<Vec<_>>()
+            .await;
+    }
+}
 
-            let active_targets = active_chunk_servers(&state)
-                .into_iter()
-                .filter(|server| {
-                    !record
-                        .replicas
-                        .iter()
-                        .any(|replica| replica.node_id == server.node_id)
+/// Restores replication for one under-replicated chunk: reads a verified
+/// copy from a surviving replica and pushes it to active chunkservers that
+/// do not hold the chunk yet.
+async fn run_repair(node: &MetadataNode, state: &MetadataStateMachine, repair: RepairTask) {
+    let Some(record) = state.chunk_records.get(&repair.chunk_id) else {
+        return;
+    };
+    let Some(bytes) = fetch_repair_source(&node.inner.channels, state, record).await else {
+        return;
+    };
+
+    let active_targets = active_chunk_servers(state)
+        .into_iter()
+        .filter(|server| {
+            !record
+                .replicas
+                .iter()
+                .any(|replica| replica.node_id == server.node_id)
+        })
+        .collect::<Vec<_>>();
+
+    let mut replica_count = record.replicas.len();
+    for target in active_targets {
+        if replica_count >= repair.expected_replicas as usize {
+            break;
+        }
+        if replicate_chunk(
+            &node.inner.channels,
+            &target.addr,
+            &record.chunk_id,
+            &record.checksum,
+            bytes.clone(),
+        )
+        .await
+        .is_ok()
+        {
+            replica_count += 1;
+            let _ = node
+                .write_command(MetadataCommand::RecordReplicaRepair {
+                    chunk_id: record.chunk_id.clone(),
+                    node_id: target.node_id.clone(),
                 })
-                .collect::<Vec<_>>();
-
-            for target in active_targets {
-                if record.replicas.len() >= repair.expected_replicas as usize {
-                    break;
-                }
-                if replicate_chunk(
-                    &node.inner.channels,
-                    &target.addr,
-                    &record.chunk_id,
-                    &record.checksum,
-                    bytes.clone(),
-                )
-                .await
-                .is_ok()
-                {
-                    let _ = node
-                        .write_command(MetadataCommand::RecordReplicaRepair {
-                            chunk_id: record.chunk_id.clone(),
-                            node_id: target.node_id.clone(),
-                        })
-                        .await;
-                }
-            }
+                .await;
         }
     }
 }
@@ -1332,8 +1362,20 @@ fn apply_command(
             capacity,
             used,
             inventory,
+            inventory_digest,
             now_ms,
-        } => apply_heartbeat(state, node_id, addr, capacity, used, inventory, now_ms),
+        } => apply_heartbeat(
+            state,
+            HeartbeatArgs {
+                node_id,
+                addr,
+                capacity,
+                used,
+                inventory,
+                inventory_digest,
+                now_ms,
+            },
+        ),
         MetadataCommand::ReportReplicaFailure {
             chunk_id,
             node_id,
@@ -1647,15 +1689,64 @@ fn apply_commit_upload(
     Ok(MetadataResponse::FileManifest(manifest))
 }
 
-fn apply_heartbeat(
-    state: &mut MetadataStateMachine,
+struct HeartbeatArgs {
     node_id: String,
     addr: String,
     capacity: u64,
     used: u64,
-    inventory: Vec<ChunkInventoryEntry>,
+    inventory: Option<Vec<ChunkInventoryEntry>>,
+    inventory_digest: String,
     now_ms: u64,
+}
+
+fn apply_heartbeat(
+    state: &mut MetadataStateMachine,
+    args: HeartbeatArgs,
 ) -> Result<MetadataResponse> {
+    let HeartbeatArgs {
+        node_id,
+        addr,
+        capacity,
+        used,
+        inventory,
+        inventory_digest,
+        now_ms,
+    } = args;
+
+    let Some(inventory) = inventory else {
+        // Liveness-only heartbeat: refresh the server record and ask for a
+        // full inventory if the reported digest diverged from ours (or the
+        // server is unknown, e.g. after a leader restart from snapshot).
+        return match state.chunk_servers.get_mut(&node_id) {
+            Some(existing) => {
+                existing.addr = addr;
+                existing.capacity = capacity;
+                existing.used = used;
+                existing.last_heartbeat_unix_ms = now_ms;
+                Ok(MetadataResponse::HeartbeatAck {
+                    resend_inventory: existing.inventory_digest != inventory_digest,
+                })
+            }
+            None => {
+                state.chunk_servers.insert(
+                    node_id.clone(),
+                    ChunkServerState {
+                        node_id,
+                        addr,
+                        capacity,
+                        used,
+                        last_heartbeat_unix_ms: now_ms,
+                        inventory: BTreeMap::new(),
+                        inventory_digest: String::new(),
+                    },
+                );
+                Ok(MetadataResponse::HeartbeatAck {
+                    resend_inventory: true,
+                })
+            }
+        };
+    };
+
     let inventory_map = inventory
         .into_iter()
         .map(|chunk| (chunk.chunk_id.clone(), chunk))
@@ -1669,6 +1760,7 @@ fn apply_heartbeat(
             used,
             last_heartbeat_unix_ms: now_ms,
             inventory: inventory_map.clone(),
+            inventory_digest,
         },
     );
 
@@ -1699,7 +1791,9 @@ fn apply_heartbeat(
         }
     }
 
-    Ok(MetadataResponse::Ack)
+    Ok(MetadataResponse::HeartbeatAck {
+        resend_inventory: false,
+    })
 }
 
 fn apply_report_replica_failure(
