@@ -1881,14 +1881,13 @@ async fn fetch_chunk(addr: &str, chunk_id: &str) -> Result<Vec<u8>> {
 }
 
 async fn replicate_chunk(addr: &str, chunk_id: &str, checksum: &str, data: Vec<u8>) -> Result<()> {
-    let mut client = chunk_client(addr).await?;
-    client
-        .replicate_chunk(pb::ReplicateChunkRequest {
-            chunk_id: chunk_id.to_string(),
-            checksum: checksum.to_string(),
-            data,
-        })
-        .await?;
+    let header = pb::PutChunkHeader {
+        chunk_id: chunk_id.to_string(),
+        checksum: checksum.to_string(),
+        size: data.len() as u64,
+        forward_targets: Vec::new(),
+    };
+    crate::chunk::send_chunk(addr, header, data).await?;
     Ok(())
 }
 

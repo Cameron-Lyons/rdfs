@@ -1,7 +1,7 @@
+use crate::chunk::send_chunk;
 use crate::pb;
 use crate::util::checksum_hex;
 use anyhow::{Result, bail};
-use futures_util::stream;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -401,32 +401,23 @@ impl FileWriter {
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("metadata returned no chunk replicas"))?;
 
+        let size = data.len() as u64;
         let header = pb::PutChunkHeader {
             chunk_id: placement.chunk_id.clone(),
             checksum: checksum.clone(),
-            size: data.len() as u64,
+            size,
             forward_targets: placement.replicas.iter().skip(1).cloned().collect(),
         };
-        let stream = stream::iter(vec![
-            pb::PutChunkRequest {
-                item: Some(pb::put_chunk_request::Item::Header(header)),
-            },
-            pb::PutChunkRequest {
-                item: Some(pb::put_chunk_request::Item::Data(data.clone())),
-            },
-        ]);
-
-        let mut client = chunk_client(&primary.addr).await?;
-        client.put_chunk(stream).await?;
+        send_chunk(&primary.addr, header, data).await?;
 
         self.chunks.push(pb::CommitChunk {
             chunk_id: placement.chunk_id,
             offset: self.offset,
-            size: data.len() as u64,
+            size,
             checksum,
             replicas: placement.replicas,
         });
-        self.offset += data.len() as u64;
+        self.offset += size;
         Ok(())
     }
 }
@@ -453,76 +444,57 @@ impl FileReader {
 async fn read_chunk(client: &Client, chunk: &pb::ChunkRef) -> Result<Vec<u8>> {
     let mut last_error = None::<anyhow::Error>;
     for replica in &chunk.replicas {
-        match chunk_client(&replica.addr).await {
-            Ok(mut remote) => match remote
-                .get_chunk(pb::GetChunkRequest {
-                    chunk_id: chunk.chunk_id.clone(),
-                })
-                .await
-            {
-                Ok(response) => {
-                    let mut stream = response.into_inner();
-                    let mut metadata = None;
-                    let mut bytes = Vec::new();
-                    while let Some(message) = stream.message().await? {
-                        match message.item {
-                            Some(pb::get_chunk_response::Item::Metadata(info)) => {
-                                metadata = Some(info)
-                            }
-                            Some(pb::get_chunk_response::Item::Data(data)) => {
-                                bytes.extend_from_slice(&data)
-                            }
-                            None => {}
-                        }
-                    }
-                    let Some(metadata) = metadata else {
-                        client
-                            .report_replica_failure_best_effort(
-                                chunk.chunk_id.clone(),
-                                replica.node_id.clone(),
-                                "missing chunk metadata".to_string(),
-                            )
-                            .await;
-                        last_error = Some(anyhow::anyhow!("missing chunk metadata"));
-                        continue;
-                    };
-                    if checksum_hex(&bytes) != metadata.checksum {
-                        client
-                            .report_replica_failure_best_effort(
-                                chunk.chunk_id.clone(),
-                                replica.node_id.clone(),
-                                "checksum mismatch while reading chunk".to_string(),
-                            )
-                            .await;
-                        last_error = Some(anyhow::anyhow!("checksum mismatch while reading chunk"));
-                        continue;
-                    }
-                    return Ok(bytes);
-                }
-                Err(status) => {
-                    client
-                        .report_replica_failure_best_effort(
-                            chunk.chunk_id.clone(),
-                            replica.node_id.clone(),
-                            format!("read failure from {}: {status}", replica.addr),
-                        )
-                        .await;
-                    last_error = Some(anyhow::anyhow!("chunk replica {}: {status}", replica.addr))
-                }
-            },
+        match read_replica(replica, chunk).await {
+            Ok(bytes) => return Ok(bytes),
             Err(error) => {
                 client
                     .report_replica_failure_best_effort(
                         chunk.chunk_id.clone(),
                         replica.node_id.clone(),
-                        format!("transport failure to {}: {error}", replica.addr),
+                        format!("read failure from {}: {error}", replica.addr),
                     )
                     .await;
-                last_error = Some(anyhow::anyhow!("chunk replica {}: {error}", replica.addr))
+                last_error = Some(anyhow::anyhow!("chunk replica {}: {error}", replica.addr));
             }
         }
     }
     Err(last_error.unwrap_or_else(|| anyhow::anyhow!("failed to read chunk")))
+}
+
+/// Reads one replica end to end and verifies the bytes against the manifest
+/// checksum. Any transport, stream, or integrity error is returned so the
+/// caller can fail over to the next replica.
+async fn read_replica(replica: &pb::ChunkReplica, chunk: &pb::ChunkRef) -> Result<Vec<u8>> {
+    let mut remote = chunk_client(&replica.addr).await?;
+    let response = remote
+        .get_chunk(pb::GetChunkRequest {
+            chunk_id: chunk.chunk_id.clone(),
+        })
+        .await?;
+    let mut stream = response.into_inner();
+    let mut saw_metadata = false;
+    let mut bytes = Vec::with_capacity(chunk.size as usize);
+    while let Some(message) = stream.message().await? {
+        match message.item {
+            Some(pb::get_chunk_response::Item::Metadata(_)) => saw_metadata = true,
+            Some(pb::get_chunk_response::Item::Data(data)) => bytes.extend_from_slice(&data),
+            None => {}
+        }
+    }
+    if !saw_metadata {
+        bail!("missing chunk metadata");
+    }
+    if bytes.len() as u64 != chunk.size {
+        bail!(
+            "chunk size mismatch: manifest says {} bytes, replica sent {}",
+            chunk.size,
+            bytes.len()
+        );
+    }
+    if checksum_hex(&bytes) != chunk.checksum {
+        bail!("checksum mismatch while reading chunk");
+    }
+    Ok(bytes)
 }
 
 async fn metadata_client(addr: &str) -> Result<MetadataClient, tonic::transport::Error> {

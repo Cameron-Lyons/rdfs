@@ -5,6 +5,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub fn checksum_hex(data: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(data);
+    digest_hex(hasher)
+}
+
+pub fn digest_hex(hasher: Sha256) -> String {
     let digest = hasher.finalize();
     let bytes: &[u8] = digest.as_ref();
     let mut checksum = String::with_capacity(bytes.len() * 2);
