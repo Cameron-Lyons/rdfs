@@ -1,5 +1,6 @@
 pub mod chunk;
 pub mod client;
+pub mod erasure;
 pub mod local;
 pub mod meta;
 pub mod model;
