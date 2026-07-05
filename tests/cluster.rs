@@ -280,6 +280,110 @@ async fn large_multi_chunk_files_round_trip() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn appends_extend_committed_files() -> anyhow::Result<()> {
+    let cluster = start_cluster().await?;
+    let client = Client::new(cluster.meta_addrs.clone())?;
+    let _ = client.mkdir("/logs").await?;
+
+    // Small chunks so appends span chunk boundaries.
+    let options = WriteOptions {
+        replication_factor: 3,
+        chunk_size: 1024,
+    };
+    let mut expected = patterned_bytes(1500);
+    let mut writer = client
+        .create_writer("/logs/app.log", options.clone())
+        .await?;
+    writer.write(&expected).await?;
+    writer.commit().await?;
+
+    // Two appends: one small, one crossing several chunk boundaries.
+    for extra_len in [10usize, 5000] {
+        let extra = patterned_bytes(extra_len);
+        let mut writer = client
+            .append_writer("/logs/app.log", options.clone())
+            .await?;
+        writer.write(&extra).await?;
+        let manifest = writer.commit().await?;
+        expected.extend_from_slice(&extra);
+        let info = manifest.info.expect("manifest info");
+        assert_eq!(info.size, expected.len() as u64);
+    }
+
+    let reader = client.open_reader("/logs/app.log").await?;
+    assert_eq!(reader.read_all().await?, expected);
+
+    // Appending to a missing file fails.
+    assert!(
+        client
+            .append_writer("/logs/missing.log", options)
+            .await
+            .is_err()
+    );
+
+    cluster.stop().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn write_at_overwrites_arbitrary_ranges() -> anyhow::Result<()> {
+    let cluster = start_cluster().await?;
+    let client = Client::new(cluster.meta_addrs.clone())?;
+    let _ = client.mkdir("/rw").await?;
+
+    let options = WriteOptions {
+        replication_factor: 3,
+        chunk_size: 1024,
+    };
+    let mut expected = patterned_bytes(4096);
+    let mut writer = client.create_writer("/rw/data.bin", options).await?;
+    writer.write(&expected).await?;
+    writer.commit().await?;
+
+    let splice = |offset: usize, data: &[u8], expected: &mut Vec<u8>| {
+        let end = offset + data.len();
+        if end > expected.len() {
+            expected.resize(end, 0);
+        }
+        expected[offset..end].copy_from_slice(data);
+    };
+
+    // Within one chunk, across a chunk boundary, at the very start, growing
+    // past EOF (4000 + 500 leaves the file 4500 bytes long), and a pure
+    // append at the resulting EOF.
+    for (offset, len) in [
+        (100usize, 50usize),
+        (1000, 100),
+        (0, 7),
+        (4000, 500),
+        (4500, 40),
+    ] {
+        let data = vec![offset as u8 ^ 0x5a; len];
+        client
+            .write_at("/rw/data.bin", offset as u64, &data)
+            .await?;
+        splice(offset, &data, &mut expected);
+        let reader = client.open_reader("/rw/data.bin").await?;
+        assert_eq!(
+            reader.read_all().await?,
+            expected,
+            "offset {offset} len {len}"
+        );
+    }
+
+    // Writing past EOF (leaving a hole) is rejected.
+    assert!(
+        client
+            .write_at("/rw/data.bin", expected.len() as u64 + 1, b"x")
+            .await
+            .is_err()
+    );
+
+    cluster.stop().await;
+    Ok(())
+}
+
 fn patterned_bytes(len: usize) -> Vec<u8> {
     let mut state = 0x9e3779b97f4a7c15u64;
     (0..len)

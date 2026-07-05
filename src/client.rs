@@ -231,6 +231,68 @@ impl Client {
             .await
     }
 
+    /// Opens a writer whose committed chunks are appended after the file's
+    /// existing contents. The chunk size is inherited from the file.
+    pub async fn append_writer(&self, path: &str, options: WriteOptions) -> Result<FileWriter> {
+        self.begin_writer(path, pb::UploadMode::Append, options)
+            .await
+    }
+
+    /// Writes `data` over the file at `offset` (`pwrite` semantics: the file
+    /// grows when the range reaches past the current end, and `offset` may
+    /// be at most the file's size). Existing chunks that partially overlap
+    /// the range are read back and rewritten around it, all under the upload
+    /// session's exclusive lease on the path.
+    pub async fn write_at(&self, path: &str, offset: u64, data: &[u8]) -> Result<pb::FileManifest> {
+        let mut writer = self
+            .begin_writer(path, pb::UploadMode::ReplaceRange, WriteOptions::default())
+            .await?;
+
+        // The lease taken above excludes other writers, so the manifest read
+        // here cannot change before the commit.
+        let reader = self.open_reader(path).await?;
+        let manifest = reader.manifest();
+        let size = manifest
+            .info
+            .as_ref()
+            .map(|info| info.size)
+            .unwrap_or_default();
+        if offset > size {
+            bail!("write at offset {offset} is past the end of the file ({size} bytes)");
+        }
+        let end = offset + data.len() as u64;
+
+        let affected = manifest
+            .chunks
+            .iter()
+            .filter(|chunk| chunk.offset < end && chunk.offset + chunk.size > offset)
+            .collect::<Vec<_>>();
+        let replace_from = affected.first().map(|chunk| chunk.offset).unwrap_or(size);
+        let replace_to = affected
+            .last()
+            .map(|chunk| chunk.offset + chunk.size)
+            .unwrap_or(size);
+
+        if let Some(first) = affected.first()
+            && first.offset < offset
+        {
+            let head = read_chunk(self, first).await?;
+            writer
+                .write(&head[..(offset - first.offset) as usize])
+                .await?;
+        }
+        writer.write(data).await?;
+        if let Some(last) = affected.last()
+            && replace_to > end
+        {
+            let tail = read_chunk(self, last).await?;
+            writer.write(&tail[(end - last.offset) as usize..]).await?;
+        }
+
+        writer.replace = Some((replace_from, replace_to - replace_from));
+        writer.commit().await
+    }
+
     async fn begin_writer(
         &self,
         path: &str,
@@ -262,6 +324,7 @@ impl Client {
             inflight: VecDeque::new(),
             chunks: Vec::new(),
             offset: 0,
+            replace: None,
         })
     }
 
@@ -368,6 +431,9 @@ pub struct FileWriter {
     inflight: VecDeque<JoinHandle<Result<pb::CommitChunk>>>,
     chunks: Vec<pb::CommitChunk>,
     offset: u64,
+    /// `(replace_from, replace_len)` for range-replacement sessions; only
+    /// read by the metadata service for `ReplaceRange` uploads.
+    replace: Option<(u64, u64)>,
 }
 
 impl FileWriter {
@@ -389,9 +455,12 @@ impl FileWriter {
         }
         while self.collect_oldest().await? {}
 
+        let (replace_from, replace_len) = self.replace.unwrap_or_default();
         let request = pb::CommitUploadRequest {
             upload_id: self.session.upload_id.clone(),
             chunks: self.chunks.clone(),
+            replace_from,
+            replace_len,
         };
         let manifest = self
             .client
