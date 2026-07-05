@@ -3,7 +3,7 @@ use crate::net::ChannelCache;
 use crate::pb;
 use crate::util::checksum_hex;
 use anyhow::{Result, bail};
-use futures_util::{StreamExt, TryStreamExt, stream};
+use futures_util::{Stream, StreamExt, TryStreamExt, stream};
 use std::collections::VecDeque;
 use std::future::Future;
 use std::pin::Pin;
@@ -490,12 +490,40 @@ impl FileReader {
         &self.manifest
     }
 
-    pub async fn read_all(&self) -> Result<Vec<u8>> {
-        let parts = stream::iter(&self.manifest.chunks)
+    /// Streams the file as a sequence of chunk-sized byte buffers, fetching
+    /// up to [`READ_AHEAD_CHUNKS`] chunks ahead of the consumer. Memory use
+    /// stays bounded by the read-ahead window regardless of file size.
+    pub fn stream(&self) -> impl Stream<Item = Result<Vec<u8>>> + Send + '_ {
+        stream::iter(&self.manifest.chunks)
             .map(|chunk| read_chunk(&self.client, chunk))
             .buffered(READ_AHEAD_CHUNKS)
-            .try_collect::<Vec<_>>()
-            .await?;
+    }
+
+    pub async fn read_all(&self) -> Result<Vec<u8>> {
+        let parts = self.stream().try_collect::<Vec<_>>().await?;
+        Ok(parts.concat())
+    }
+
+    /// Reads `length` bytes starting at `offset`, fetching only the chunks
+    /// that overlap the range. Ranges reaching past the end of the file are
+    /// truncated, matching `pread` semantics.
+    pub async fn read_range(&self, offset: u64, length: u64) -> Result<Vec<u8>> {
+        let end = offset.saturating_add(length);
+        let parts = stream::iter(
+            self.manifest
+                .chunks
+                .iter()
+                .filter(|chunk| chunk.offset < end && chunk.offset + chunk.size > offset),
+        )
+        .map(|chunk| async move {
+            let bytes = read_chunk(&self.client, chunk).await?;
+            let from = offset.saturating_sub(chunk.offset) as usize;
+            let to = (end.min(chunk.offset + chunk.size) - chunk.offset) as usize;
+            Ok::<_, anyhow::Error>(bytes[from..to].to_vec())
+        })
+        .buffered(READ_AHEAD_CHUNKS)
+        .try_collect::<Vec<_>>()
+        .await?;
         Ok(parts.concat())
     }
 }
