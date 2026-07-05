@@ -9,7 +9,7 @@ use crate::net::ChannelCache;
 use crate::path::{is_child_of, normalize_path, parent_path};
 use crate::pb;
 use crate::raft::{MetaNodeId, MetaRaft, MetaTypeConfig};
-use crate::util::{checksum_hex, now_millis};
+use crate::util::{checksum_hex, now_millis, unique_id};
 use anyhow::{Result, bail};
 use futures_util::{Stream, StreamExt, TryStreamExt, stream};
 use openraft::entry::RaftEntry;
@@ -35,7 +35,6 @@ use std::time::Duration;
 use tokio::sync::{RwLock, watch};
 use tonic::transport::{Channel, Server};
 use tonic::{Request, Response, Status};
-use uuid::Uuid;
 
 const LOG_PREFIX: &str = "log/";
 const VOTE_KEY: &[u8] = b"vote";
@@ -152,7 +151,7 @@ impl RaftSnapshotBuilder<MetaTypeConfig> for Arc<MetaStore> {
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
         let snapshot_id = match state.last_applied_log {
             Some(log_id) => format!("{}-{}", log_id.committed_leader_id(), log_id.index()),
-            None => format!("bootstrap-{}", Uuid::new_v4()),
+            None => format!("bootstrap-{}", unique_id("snapshot")),
         };
         let meta = SnapshotMeta {
             last_log_id: state.last_applied_log,
@@ -812,7 +811,7 @@ impl pb::metadata_service_server::MetadataService for MetadataGrpc {
         let response = self
             .node
             .write_command(MetadataCommand::BeginUpload {
-                upload_id: Uuid::new_v4().to_string(),
+                upload_id: unique_id(&self.node.inner.id.to_string()),
                 path: request.path,
                 mode: UploadModeModel::try_from(request.mode).map_err(invalid_argument)?,
                 replication_factor: request.replication_factor.max(1),
@@ -833,7 +832,7 @@ impl pb::metadata_service_server::MetadataService for MetadataGrpc {
             .node
             .write_command(MetadataCommand::AllocateChunk {
                 upload_id: request.upload_id,
-                chunk_id: Uuid::new_v4().to_string(),
+                chunk_id: unique_id(&self.node.inner.id.to_string()),
                 size: request.size,
                 checksum: request.checksum,
                 now_ms: now_millis(),

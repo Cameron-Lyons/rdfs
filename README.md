@@ -11,14 +11,16 @@ RDFS is now a gRPC-based distributed file store with Raft-backed metadata, immut
 
 ## Design
 
-- Metadata uses `openraft` with RocksDB-backed log/state persistence.
+- Metadata uses `openraft` with a RocksDB-backed log. The state machine lives in memory and recovers from the latest snapshot plus committed-log replay, so applies stay O(entry) instead of re-serializing the namespace.
 - The state machine stores the namespace, file manifests, upload leases, chunk refcounts, tombstones, repair intents, and chunkserver heartbeats.
 - Chunkservers store immutable chunk files on disk with a RocksDB index.
-- Writers upload chunks to a primary replica, which stores locally and forwards to secondaries before acknowledging.
+- Chunk transfers are framed streams (256 KiB messages), so chunks are not bounded by the gRPC message limit and are never buffered whole in memory on the serving path.
+- Writers upload chunks to a primary replica; replicas form a chain that forwards frames downstream while writing, and the primary acknowledges only after the whole chain has verified the chunk.
 - `CommitUpload` atomically swaps the visible file manifest, so uncommitted uploads remain invisible.
-- Reads use leader leases before serving metadata.
+- Reads use leader leases before serving metadata; readers fetch multiple chunks concurrently and verify each against the manifest checksum.
 - Readers report corrupt or unreadable chunk replicas back to metadata so the repair loop can restore replication.
-- Chunkserver heartbeats reconcile on-disk inventory back into metadata, so restarted replicas rejoin fresh manifests automatically.
+- Chunkserver heartbeats carry an inventory digest and include the full inventory only when it changes, so steady-state heartbeats are constant-size; reconciliation lets restarted replicas rejoin fresh manifests automatically.
+- All peers talk over cached, lazily-connected gRPC channels instead of dialing per RPC.
 - Metadata membership can be changed online by adding learners, promoting voters, removing dead nodes, and replacing failed voters.
 
 ## Client API
@@ -83,6 +85,7 @@ Current test coverage includes:
 
 - path normalization
 - atomic create/write/read/overwrite/delete on a 3-meta / 3-chunk cluster
+- multi-chunk round trips with chunks larger than the gRPC message limit
 - invisibility of uncommitted uploads
 - single-writer lease enforcement
 - committed reads survive loss of one chunkserver
@@ -90,6 +93,7 @@ Current test coverage includes:
 - fresh manifests drop dead replicas after failure reports and pick them back up after chunkserver restart heartbeats
 - uploads fail cleanly when a required chunk replica disappears before replication completes
 - metadata leader failover after a committed write
+- metadata node restart recovering its state from snapshot and log replay
 - metadata voter replacement restoring quorum after losing a node
 
 ## Not In Scope
