@@ -18,7 +18,6 @@ tokio = { version = "1.49.0", features = ["fs", "io-util", "macros", "rt-multi-t
 tonic = { version = "0.14.5", features = ["transport"] }
 tonic-prost = "0.14.2"
 tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
-uuid = { version = "1.18.1", features = ["v4"] }
 
 [build-dependencies]
 protoc-bin-vendored = "3.2.0"
