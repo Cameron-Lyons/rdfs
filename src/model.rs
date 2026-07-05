@@ -35,12 +35,32 @@ pub struct ReplicaPointer {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ErasureShardModel {
+    pub chunk_id: String,
+    pub checksum: String,
+    pub node_id: String,
+}
+
+/// Erasure-coded layout of one chunk: `data_shards + parity_shards` shards
+/// of `shard_size` bytes, any `data_shards` of which reconstruct the chunk.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ErasureRefModel {
+    pub data_shards: u32,
+    pub parity_shards: u32,
+    pub shard_size: u64,
+    pub shards: Vec<ErasureShardModel>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ChunkRefModel {
     pub chunk_id: String,
     pub offset: u64,
     pub size: u64,
     pub checksum: String,
     pub replicas: Vec<ReplicaPointer>,
+    /// Set for erasure-coded chunks; `replicas` is empty in that case.
+    #[serde(default)]
+    pub erasure: Option<ErasureRefModel>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -89,6 +109,31 @@ pub struct FileManifestModel {
     pub chunks: Vec<ChunkRefModel>,
 }
 
+impl ErasureRefModel {
+    pub fn to_proto<F>(&self, mut addr_for: F) -> pb::ErasureInfo
+    where
+        F: FnMut(&str) -> Option<String>,
+    {
+        pb::ErasureInfo {
+            data_shards: self.data_shards,
+            parity_shards: self.parity_shards,
+            shard_size: self.shard_size,
+            shards: self
+                .shards
+                .iter()
+                .map(|shard| pb::ErasureShard {
+                    chunk_id: shard.chunk_id.clone(),
+                    checksum: shard.checksum.clone(),
+                    replica: addr_for(&shard.node_id).map(|addr| pb::ChunkReplica {
+                        node_id: shard.node_id.clone(),
+                        addr,
+                    }),
+                })
+                .collect(),
+        }
+    }
+}
+
 impl FileManifestModel {
     pub fn to_proto<F>(&self, mut addr_for: F) -> pb::FileManifest
     where
@@ -112,6 +157,10 @@ impl FileManifestModel {
                         })
                     })
                     .collect(),
+                erasure: chunk
+                    .erasure
+                    .as_ref()
+                    .map(|erasure| erasure.to_proto(&mut addr_for)),
             })
             .collect();
 
@@ -128,6 +177,8 @@ pub struct UploadSessionModel {
     pub lease_expiry_unix_ms: u64,
     pub chunk_size: u32,
     pub replication_factor: u32,
+    pub data_shards: u32,
+    pub parity_shards: u32,
 }
 
 impl UploadSessionModel {
@@ -137,6 +188,8 @@ impl UploadSessionModel {
             lease_expiry_unix_ms: self.lease_expiry_unix_ms,
             chunk_size: self.chunk_size,
             replication_factor: self.replication_factor,
+            data_shards: self.data_shards,
+            parity_shards: self.parity_shards,
         }
     }
 }
@@ -145,6 +198,7 @@ impl UploadSessionModel {
 pub struct ChunkPlacementModel {
     pub chunk_id: String,
     pub replicas: Vec<ChunkReplicaAssignment>,
+    pub shards: Vec<PendingShard>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -165,8 +219,27 @@ impl ChunkPlacementModel {
                     addr: replica.addr.clone(),
                 })
                 .collect(),
+            shards: self
+                .shards
+                .iter()
+                .map(|shard| pb::ErasureShard {
+                    chunk_id: shard.chunk_id.clone(),
+                    checksum: shard.checksum.clone(),
+                    replica: Some(pb::ChunkReplica {
+                        node_id: shard.node.node_id.clone(),
+                        addr: shard.node.addr.clone(),
+                    }),
+                })
+                .collect(),
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PendingShard {
+    pub chunk_id: String,
+    pub checksum: String,
+    pub node: ChunkReplicaAssignment,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -175,6 +248,11 @@ pub struct PendingChunk {
     pub size: u64,
     pub checksum: String,
     pub replicas: Vec<ChunkReplicaAssignment>,
+    /// For erasure-coded sessions: per-shard ids, checksums, and placements.
+    #[serde(default)]
+    pub shards: Vec<PendingShard>,
+    #[serde(default)]
+    pub shard_size: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -185,7 +263,24 @@ pub struct UploadSessionState {
     pub lease_expiry_unix_ms: u64,
     pub chunk_size: u32,
     pub replication_factor: u32,
+    /// Non-zero when the session stores chunks erasure-coded.
+    #[serde(default)]
+    pub data_shards: u32,
+    #[serde(default)]
+    pub parity_shards: u32,
     pub allocations: BTreeMap<String, PendingChunk>,
+}
+
+/// Ties a shard's chunk record back to its erasure group so a lost shard
+/// can be rebuilt from its peers.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ErasureGroupLink {
+    pub shard_index: u32,
+    pub data_shards: u32,
+    pub parity_shards: u32,
+    /// Chunk ids of all shards in the group, in index order (including this
+    /// shard's own id at `shard_index`).
+    pub peers: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -196,6 +291,9 @@ pub struct ChunkRecord {
     pub desired_replication: u32,
     pub replicas: Vec<ReplicaPointer>,
     pub ref_count: u64,
+    /// Present when this chunk is one shard of an erasure group.
+    #[serde(default)]
+    pub erasure: Option<ErasureGroupLink>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -356,6 +454,10 @@ pub enum MetadataCommand {
         mode: UploadModeModel,
         replication_factor: u32,
         chunk_size: u32,
+        #[serde(default)]
+        data_shards: u32,
+        #[serde(default)]
+        parity_shards: u32,
         now_ms: u64,
         lease_ttl_ms: u64,
     },
@@ -364,6 +466,14 @@ pub enum MetadataCommand {
         chunk_id: String,
         size: u64,
         checksum: String,
+        /// For erasure-coded sessions: ids and checksums of the shards, in
+        /// index order.
+        #[serde(default)]
+        shard_chunk_ids: Vec<String>,
+        #[serde(default)]
+        shard_checksums: Vec<String>,
+        #[serde(default)]
+        shard_size: u64,
         now_ms: u64,
     },
     CommitUpload {
@@ -416,12 +526,38 @@ pub struct CommitChunkModel {
     pub size: u64,
     pub checksum: String,
     pub replicas: Vec<ChunkReplicaAssignment>,
+    #[serde(default)]
+    pub erasure: Option<ErasureRefModel>,
 }
 
 impl TryFrom<pb::CommitChunk> for CommitChunkModel {
     type Error = anyhow::Error;
 
     fn try_from(value: pb::CommitChunk) -> Result<Self> {
+        let erasure = value
+            .erasure
+            .map(|erasure| -> Result<ErasureRefModel> {
+                Ok(ErasureRefModel {
+                    data_shards: erasure.data_shards,
+                    parity_shards: erasure.parity_shards,
+                    shard_size: erasure.shard_size,
+                    shards: erasure
+                        .shards
+                        .into_iter()
+                        .map(|shard| -> Result<ErasureShardModel> {
+                            let replica = shard
+                                .replica
+                                .ok_or_else(|| anyhow::anyhow!("shard is missing its replica"))?;
+                            Ok(ErasureShardModel {
+                                chunk_id: shard.chunk_id,
+                                checksum: shard.checksum,
+                                node_id: replica.node_id,
+                            })
+                        })
+                        .collect::<Result<Vec<_>>>()?,
+                })
+            })
+            .transpose()?;
         Ok(Self {
             chunk_id: value.chunk_id,
             offset: value.offset,
@@ -435,6 +571,7 @@ impl TryFrom<pb::CommitChunk> for CommitChunkModel {
                     addr: replica.addr,
                 })
                 .collect(),
+            erasure,
         })
     }
 }

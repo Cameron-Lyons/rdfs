@@ -288,8 +288,8 @@ async fn appends_extend_committed_files() -> anyhow::Result<()> {
 
     // Small chunks so appends span chunk boundaries.
     let options = WriteOptions {
-        replication_factor: 3,
         chunk_size: 1024,
+        ..WriteOptions::default()
     };
     let mut expected = patterned_bytes(1500);
     let mut writer = client
@@ -333,8 +333,8 @@ async fn write_at_overwrites_arbitrary_ranges() -> anyhow::Result<()> {
     let _ = client.mkdir("/rw").await?;
 
     let options = WriteOptions {
-        replication_factor: 3,
         chunk_size: 1024,
+        ..WriteOptions::default()
     };
     let mut expected = patterned_bytes(4096);
     let mut writer = client.create_writer("/rw/data.bin", options).await?;
@@ -382,6 +382,115 @@ async fn write_at_overwrites_arbitrary_ranges() -> anyhow::Result<()> {
 
     cluster.stop().await;
     Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn erasure_coded_files_round_trip_and_survive_corruption() -> anyhow::Result<()> {
+    let cluster = start_cluster().await?;
+    let client = Client::new(cluster.meta_addrs.clone())?;
+    let _ = client.mkdir("/ec").await?;
+
+    // RS(2,1) across the three chunkservers: one shard per server, 1.5x
+    // storage instead of 3x.
+    let options = WriteOptions {
+        chunk_size: 1024,
+        erasure: Some((2, 1)),
+        ..WriteOptions::default()
+    };
+    let expected = patterned_bytes(3000);
+    let mut writer = client.create_writer("/ec/data.bin", options).await?;
+    writer.write(&expected).await?;
+    let manifest = writer.commit().await?;
+    for chunk in &manifest.chunks {
+        let erasure = chunk.erasure.as_ref().expect("chunk is erasure-coded");
+        assert_eq!(erasure.data_shards, 2);
+        assert_eq!(erasure.parity_shards, 1);
+        assert_eq!(erasure.shards.len(), 3);
+        assert!(chunk.replicas.is_empty());
+    }
+
+    let reader = client.open_reader("/ec/data.bin").await?;
+    assert_eq!(reader.read_all().await?, expected);
+
+    // Corrupting one shard on disk forces a parity reconstruction on read.
+    let shard_path = first_chunk_path(cluster.root_dir.join("chunk-1").join("chunks")).await?;
+    tokio::fs::write(&shard_path, b"corrupt shard bytes").await?;
+    let reader = client.open_reader("/ec/data.bin").await?;
+    assert_eq!(reader.read_all().await?, expected);
+
+    cluster.stop().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn lost_erasure_shards_are_rebuilt_from_parity() -> anyhow::Result<()> {
+    let mut cluster = start_cluster().await?;
+    let client = Client::new(cluster.meta_addrs.clone())?;
+    let _ = client.mkdir("/ec-repair").await?;
+
+    let options = WriteOptions {
+        chunk_size: 1024,
+        erasure: Some((2, 1)),
+        ..WriteOptions::default()
+    };
+    let expected = patterned_bytes(2500);
+    let mut writer = client.create_writer("/ec-repair/data.bin", options).await?;
+    writer.write(&expected).await?;
+    writer.commit().await?;
+
+    // Losing one chunkserver loses one shard per chunk. Reads keep working
+    // degraded, and the repair loop rebuilds the lost shards from parity
+    // onto the surviving servers.
+    cluster.stop_chunk("chunk-1").await?;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    let reader = client.open_reader("/ec-repair/data.bin").await?;
+    assert_eq!(reader.read_all().await?, expected);
+
+    wait_for_erasure_shards_off_node(
+        &client,
+        "/ec-repair/data.bin",
+        "chunk-1",
+        Duration::from_secs(15),
+    )
+    .await?;
+
+    let reader = client.open_reader("/ec-repair/data.bin").await?;
+    assert_eq!(reader.read_all().await?, expected);
+
+    cluster.stop().await;
+    Ok(())
+}
+
+/// Waits until no erasure shard of any chunk of `path` resolves to
+/// `node_id`, i.e. repair has rebuilt the lost shards elsewhere.
+async fn wait_for_erasure_shards_off_node(
+    client: &Client,
+    path: &str,
+    node_id: &str,
+    timeout: Duration,
+) -> anyhow::Result<()> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let manifest = client.open_reader(path).await?.manifest().clone();
+        let all_healthy = manifest.chunks.iter().all(|chunk| {
+            chunk.erasure.as_ref().is_some_and(|erasure| {
+                erasure.shards.iter().all(|shard| {
+                    shard
+                        .replica
+                        .as_ref()
+                        .is_some_and(|replica| replica.node_id != node_id)
+                })
+            })
+        });
+        if all_healthy {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            anyhow::bail!("timed out waiting for shards of {path} to move off {node_id}");
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
 }
 
 fn patterned_bytes(len: usize) -> Vec<u8> {

@@ -1,9 +1,9 @@
 use crate::model::{
     ChunkInventoryEntry, ChunkPlacementModel, ChunkRecord, ChunkReplicaAssignment,
-    ChunkServerState, ChunkTombstone, CommitChunkModel, DirectoryRecord, FileInfoModel,
-    FileManifestModel, FileRecord, MetadataCommand, MetadataResponse, MetadataStateMachine,
-    NamespaceEntry, PendingChunk, RepairTask, ReplicaPointer, UploadModeModel, UploadSessionModel,
-    UploadSessionState,
+    ChunkServerState, ChunkTombstone, CommitChunkModel, DirectoryRecord, ErasureGroupLink,
+    FileInfoModel, FileManifestModel, FileRecord, MetadataCommand, MetadataResponse,
+    MetadataStateMachine, NamespaceEntry, PendingChunk, PendingShard, RepairTask, ReplicaPointer,
+    UploadModeModel, UploadSessionModel, UploadSessionState,
 };
 use crate::net::ChannelCache;
 use crate::path::{is_child_of, normalize_path, parent_path};
@@ -834,6 +834,8 @@ impl pb::metadata_service_server::MetadataService for MetadataGrpc {
                 mode: UploadModeModel::try_from(request.mode).map_err(invalid_argument)?,
                 replication_factor: request.replication_factor.max(1),
                 chunk_size: request.chunk_size.max(1),
+                data_shards: request.data_shards,
+                parity_shards: request.parity_shards,
                 now_ms: now_millis(),
                 lease_ttl_ms: LEASE_TTL_MS,
             })
@@ -853,6 +855,13 @@ impl pb::metadata_service_server::MetadataService for MetadataGrpc {
                 chunk_id: unique_id(&self.node.inner.id.to_string()),
                 size: request.size,
                 checksum: request.checksum,
+                shard_chunk_ids: request
+                    .shard_checksums
+                    .iter()
+                    .map(|_| unique_id(&self.node.inner.id.to_string()))
+                    .collect(),
+                shard_checksums: request.shard_checksums,
+                shard_size: request.shard_size,
                 now_ms: now_millis(),
             })
             .await?;
@@ -1269,16 +1278,42 @@ async fn repair_loop(node: MetadataNode) {
 
 /// Restores replication for one under-replicated chunk: reads a verified
 /// copy from a surviving replica and pushes it to active chunkservers that
-/// do not hold the chunk yet.
+/// do not hold the chunk yet. A lost erasure shard has no other replica to
+/// copy from, so it is rebuilt from its peer shards instead.
 async fn run_repair(node: &MetadataNode, state: &MetadataStateMachine, repair: RepairTask) {
     let Some(record) = state.chunk_records.get(&repair.chunk_id) else {
         return;
     };
-    let Some(bytes) = fetch_repair_source(&node.inner.channels, state, record).await else {
-        return;
+    let bytes = match fetch_repair_source(&node.inner.channels, state, record).await {
+        Some(bytes) => bytes,
+        None => match &record.erasure {
+            Some(erasure) => {
+                let Some(bytes) = reconstruct_shard(node, state, erasure).await else {
+                    return;
+                };
+                bytes
+            }
+            None => return,
+        },
     };
 
-    let active_targets = active_chunk_servers(state)
+    // Prefer servers that hold neither this chunk nor (for erasure shards)
+    // any peer shard, so one server loss keeps costing at most one shard;
+    // fall back to peer-hosting servers rather than staying under-replicated.
+    let peer_hosts = record
+        .erasure
+        .as_ref()
+        .map(|erasure| {
+            erasure
+                .peers
+                .iter()
+                .filter(|peer| peer.as_str() != record.chunk_id)
+                .filter_map(|peer| state.chunk_records.get(peer))
+                .flat_map(|peer| peer.replicas.iter().map(|replica| replica.node_id.clone()))
+                .collect::<BTreeSet<_>>()
+        })
+        .unwrap_or_default();
+    let mut active_targets = active_chunk_servers(state)
         .into_iter()
         .filter(|server| {
             !record
@@ -1287,6 +1322,7 @@ async fn run_repair(node: &MetadataNode, state: &MetadataStateMachine, repair: R
                 .any(|replica| replica.node_id == server.node_id)
         })
         .collect::<Vec<_>>();
+    active_targets.sort_by_key(|server| peer_hosts.contains(&server.node_id));
 
     let mut replica_count = record.replicas.len();
     for target in active_targets {
@@ -1312,6 +1348,42 @@ async fn run_repair(node: &MetadataNode, state: &MetadataStateMachine, repair: R
                 .await;
         }
     }
+}
+
+/// Rebuilds one lost erasure shard from any `data_shards` of its peers.
+async fn reconstruct_shard(
+    node: &MetadataNode,
+    state: &MetadataStateMachine,
+    link: &ErasureGroupLink,
+) -> Option<Vec<u8>> {
+    let coder =
+        crate::erasure::ErasureCoder::new(link.data_shards as usize, link.parity_shards as usize)
+            .ok()?;
+    if link.peers.len() != coder.total_shards() {
+        return None;
+    }
+    let mut shards: Vec<Option<Vec<u8>>> = vec![None; coder.total_shards()];
+    let mut available = 0usize;
+    for (index, peer_id) in link.peers.iter().enumerate() {
+        if available >= coder.data_shards() {
+            break;
+        }
+        if index as u32 == link.shard_index {
+            continue;
+        }
+        let Some(peer) = state.chunk_records.get(peer_id) else {
+            continue;
+        };
+        if let Some(bytes) = fetch_repair_source(&node.inner.channels, state, peer).await {
+            shards[index] = Some(bytes);
+            available += 1;
+        }
+    }
+    if available < coder.data_shards() {
+        return None;
+    }
+    coder.reconstruct(&mut shards).ok()?;
+    shards[link.shard_index as usize].take()
 }
 
 async fn fetch_repair_source(
@@ -1350,6 +1422,8 @@ fn apply_command(
             mode,
             replication_factor,
             chunk_size,
+            data_shards,
+            parity_shards,
             now_ms,
             lease_ttl_ms,
         } => apply_begin_upload(
@@ -1360,6 +1434,8 @@ fn apply_command(
                 mode,
                 replication_factor,
                 chunk_size,
+                data_shards,
+                parity_shards,
                 now_ms,
                 lease_ttl_ms,
             },
@@ -1369,8 +1445,23 @@ fn apply_command(
             chunk_id,
             size,
             checksum,
+            shard_chunk_ids,
+            shard_checksums,
+            shard_size,
             now_ms,
-        } => apply_allocate_chunk(state, &upload_id, &chunk_id, size, &checksum, now_ms),
+        } => apply_allocate_chunk(
+            state,
+            AllocateChunkArgs {
+                upload_id,
+                chunk_id,
+                size,
+                checksum,
+                shard_chunk_ids,
+                shard_checksums,
+                shard_size,
+                now_ms,
+            },
+        ),
         MetadataCommand::CommitUpload {
             upload_id,
             chunks,
@@ -1434,8 +1525,21 @@ struct BeginUploadArgs {
     mode: UploadModeModel,
     replication_factor: u32,
     chunk_size: u32,
+    data_shards: u32,
+    parity_shards: u32,
     now_ms: u64,
     lease_ttl_ms: u64,
+}
+
+struct AllocateChunkArgs {
+    upload_id: String,
+    chunk_id: String,
+    size: u64,
+    checksum: String,
+    shard_chunk_ids: Vec<String>,
+    shard_checksums: Vec<String>,
+    shard_size: u64,
+    now_ms: u64,
 }
 
 fn apply_mkdir(state: &mut MetadataStateMachine, path: &str) -> Result<MetadataResponse> {
@@ -1507,6 +1611,8 @@ fn apply_begin_upload(
         mode,
         replication_factor,
         chunk_size,
+        data_shards,
+        parity_shards,
         now_ms,
         lease_ttl_ms,
     } = args;
@@ -1516,6 +1622,12 @@ fn apply_begin_upload(
     }
     if chunk_size == 0 {
         bail!("chunk_size must be >= 1");
+    }
+    if (data_shards == 0) != (parity_shards == 0) {
+        bail!("data and parity shard counts must be set together");
+    }
+    if data_shards as usize + parity_shards as usize > 255 {
+        bail!("at most 255 total shards are supported");
     }
 
     reap_expired_uploads(state, now_ms);
@@ -1555,6 +1667,8 @@ fn apply_begin_upload(
         lease_expiry_unix_ms: now_ms + lease_ttl_ms,
         chunk_size,
         replication_factor,
+        data_shards,
+        parity_shards,
         allocations: BTreeMap::new(),
     };
     let response = UploadSessionModel {
@@ -1562,6 +1676,8 @@ fn apply_begin_upload(
         lease_expiry_unix_ms: session.lease_expiry_unix_ms,
         chunk_size: session.chunk_size,
         replication_factor: session.replication_factor,
+        data_shards: session.data_shards,
+        parity_shards: session.parity_shards,
     };
     state
         .upload_sessions
@@ -1571,21 +1687,74 @@ fn apply_begin_upload(
 
 fn apply_allocate_chunk(
     state: &mut MetadataStateMachine,
-    upload_id: &str,
-    chunk_id: &str,
-    size: u64,
-    checksum: &str,
-    now_ms: u64,
+    args: AllocateChunkArgs,
 ) -> Result<MetadataResponse> {
+    let AllocateChunkArgs {
+        upload_id,
+        chunk_id,
+        size,
+        checksum,
+        shard_chunk_ids,
+        shard_checksums,
+        shard_size,
+        now_ms,
+    } = args;
     let active = active_chunk_servers(state);
     let session = state
         .upload_sessions
-        .get_mut(upload_id)
+        .get_mut(&upload_id)
         .ok_or_else(|| anyhow::anyhow!("upload session not found"))?;
     if session.lease_expiry_unix_ms <= now_ms {
-        state.upload_sessions.remove(upload_id);
+        state.upload_sessions.remove(&upload_id);
         bail!("upload session expired");
     }
+
+    if session.data_shards > 0 {
+        // Erasure-coded session: place one shard per chunkserver, least
+        // used first, so any single server loss costs at most one shard.
+        let total = session.data_shards as usize + session.parity_shards as usize;
+        if shard_checksums.len() != total || shard_chunk_ids.len() != total {
+            bail!(
+                "expected {total} shard checksums, got {}",
+                shard_checksums.len()
+            );
+        }
+        if shard_size == 0 {
+            bail!("shard_size must be >= 1");
+        }
+        if active.len() < total {
+            bail!("not enough active chunkservers for {total} shards");
+        }
+        let shards = shard_chunk_ids
+            .iter()
+            .zip(&shard_checksums)
+            .zip(&active)
+            .map(|((shard_chunk_id, shard_checksum), server)| PendingShard {
+                chunk_id: shard_chunk_id.clone(),
+                checksum: shard_checksum.clone(),
+                node: ChunkReplicaAssignment {
+                    node_id: server.node_id.clone(),
+                    addr: server.addr.clone(),
+                },
+            })
+            .collect::<Vec<_>>();
+
+        let pending = PendingChunk {
+            chunk_id: chunk_id.clone(),
+            size,
+            checksum,
+            replicas: Vec::new(),
+            shards: shards.clone(),
+            shard_size,
+        };
+        session.allocations.insert(chunk_id.clone(), pending);
+        return Ok(MetadataResponse::ChunkPlacement(ChunkPlacementModel {
+            chunk_id,
+            replicas: Vec::new(),
+            shards,
+        }));
+    }
+
     if active.len() < session.replication_factor as usize {
         bail!("not enough active chunkservers");
     }
@@ -1600,15 +1769,18 @@ fn apply_allocate_chunk(
         .collect::<Vec<_>>();
 
     let pending = PendingChunk {
-        chunk_id: chunk_id.to_string(),
+        chunk_id: chunk_id.clone(),
         size,
-        checksum: checksum.to_string(),
+        checksum,
         replicas: replicas.clone(),
+        shards: Vec::new(),
+        shard_size: 0,
     };
-    session.allocations.insert(chunk_id.to_string(), pending);
+    session.allocations.insert(chunk_id.clone(), pending);
     Ok(MetadataResponse::ChunkPlacement(ChunkPlacementModel {
-        chunk_id: chunk_id.to_string(),
+        chunk_id,
         replicas,
+        shards: Vec::new(),
     }))
 }
 
@@ -1675,6 +1847,25 @@ fn apply_commit_upload(
                 chunk.chunk_id
             );
         }
+        match &chunk.erasure {
+            None if allocation.shards.is_empty() => {}
+            Some(erasure)
+                if erasure.data_shards == session.data_shards
+                    && erasure.parity_shards == session.parity_shards
+                    && erasure.shard_size == allocation.shard_size
+                    && erasure.shards.len() == allocation.shards.len()
+                    && erasure.shards.iter().zip(&allocation.shards).all(
+                        |(committed, allocated)| {
+                            committed.chunk_id == allocated.chunk_id
+                                && committed.checksum == allocated.checksum
+                                && committed.node_id == allocated.node.node_id
+                        },
+                    ) => {}
+            _ => bail!(
+                "chunk {} erasure layout does not match allocation",
+                chunk.chunk_id
+            ),
+        }
 
         new_chunks.push(crate::model::ChunkRefModel {
             chunk_id: chunk.chunk_id.clone(),
@@ -1688,6 +1879,7 @@ fn apply_commit_upload(
                     node_id: replica.node_id.clone(),
                 })
                 .collect(),
+            erasure: chunk.erasure.clone(),
         });
         next_offset += chunk.size;
     }
@@ -1780,22 +1972,42 @@ fn apply_commit_upload(
     };
 
     for chunk in &new_chunks {
-        match state.chunk_records.get_mut(&chunk.chunk_id) {
-            Some(record) => {
-                record.ref_count += 1;
-            }
-            None => {
-                state.chunk_records.insert(
-                    chunk.chunk_id.clone(),
-                    ChunkRecord {
-                        chunk_id: chunk.chunk_id.clone(),
-                        size: chunk.size,
-                        checksum: chunk.checksum.clone(),
-                        desired_replication: session.replication_factor,
-                        replicas: chunk.replicas.clone(),
-                        ref_count: 1,
-                    },
-                );
+        match &chunk.erasure {
+            None => reference_chunk(
+                state,
+                &chunk.chunk_id,
+                chunk.size,
+                &chunk.checksum,
+                session.replication_factor,
+                chunk.replicas.clone(),
+                None,
+            ),
+            Some(erasure) => {
+                // Shards are the physical chunks; the manifest's chunk id is
+                // purely logical and has no record of its own.
+                let peers = erasure
+                    .shards
+                    .iter()
+                    .map(|shard| shard.chunk_id.clone())
+                    .collect::<Vec<_>>();
+                for (index, shard) in erasure.shards.iter().enumerate() {
+                    reference_chunk(
+                        state,
+                        &shard.chunk_id,
+                        erasure.shard_size,
+                        &shard.checksum,
+                        1,
+                        vec![ReplicaPointer {
+                            node_id: shard.node_id.clone(),
+                        }],
+                        Some(ErasureGroupLink {
+                            shard_index: index as u32,
+                            data_shards: erasure.data_shards,
+                            parity_shards: erasure.parity_shards,
+                            peers: peers.clone(),
+                        }),
+                    );
+                }
             }
         }
     }
@@ -1986,6 +2198,38 @@ fn reap_expired_uploads(state: &mut MetadataStateMachine, now_ms: u64) {
         .retain(|_, session| session.lease_expiry_unix_ms > now_ms);
 }
 
+/// Adds one manifest reference to a physical chunk, creating its record on
+/// first use.
+fn reference_chunk(
+    state: &mut MetadataStateMachine,
+    chunk_id: &str,
+    size: u64,
+    checksum: &str,
+    desired_replication: u32,
+    replicas: Vec<ReplicaPointer>,
+    erasure: Option<ErasureGroupLink>,
+) {
+    match state.chunk_records.get_mut(chunk_id) {
+        Some(record) => {
+            record.ref_count += 1;
+        }
+        None => {
+            state.chunk_records.insert(
+                chunk_id.to_string(),
+                ChunkRecord {
+                    chunk_id: chunk_id.to_string(),
+                    size,
+                    checksum: checksum.to_string(),
+                    desired_replication,
+                    replicas,
+                    ref_count: 1,
+                    erasure,
+                },
+            );
+        }
+    }
+}
+
 fn release_manifest_chunks(
     state: &mut MetadataStateMachine,
     chunks: &[crate::model::ChunkRefModel],
@@ -1993,26 +2237,37 @@ fn release_manifest_chunks(
     gc_grace_ms: u64,
 ) {
     for chunk in chunks {
-        let mut remove = false;
-        if let Some(record) = state.chunk_records.get_mut(&chunk.chunk_id) {
-            if record.ref_count > 1 {
-                record.ref_count -= 1;
-            } else {
-                record.ref_count = 0;
-                state.tombstones.insert(
-                    chunk.chunk_id.clone(),
-                    ChunkTombstone {
-                        chunk_id: chunk.chunk_id.clone(),
-                        replicas: record.replicas.clone(),
-                        delete_after_unix_ms: now_ms + gc_grace_ms,
-                    },
-                );
-                remove = true;
+        match &chunk.erasure {
+            None => release_chunk(state, &chunk.chunk_id, now_ms, gc_grace_ms),
+            Some(erasure) => {
+                for shard in &erasure.shards {
+                    release_chunk(state, &shard.chunk_id, now_ms, gc_grace_ms);
+                }
             }
         }
-        if remove {
-            state.repairs.remove(&chunk.chunk_id);
+    }
+}
+
+fn release_chunk(state: &mut MetadataStateMachine, chunk_id: &str, now_ms: u64, gc_grace_ms: u64) {
+    let mut remove = false;
+    if let Some(record) = state.chunk_records.get_mut(chunk_id) {
+        if record.ref_count > 1 {
+            record.ref_count -= 1;
+        } else {
+            record.ref_count = 0;
+            state.tombstones.insert(
+                chunk_id.to_string(),
+                ChunkTombstone {
+                    chunk_id: chunk_id.to_string(),
+                    replicas: record.replicas.clone(),
+                    delete_after_unix_ms: now_ms + gc_grace_ms,
+                },
+            );
+            remove = true;
         }
+    }
+    if remove {
+        state.repairs.remove(chunk_id);
     }
 }
 
@@ -2066,6 +2321,32 @@ fn file_manifest_to_proto(state: &MetadataStateMachine, file: &FileRecord) -> pb
                     .get(&chunk.chunk_id)
                     .map(|record| &record.replicas)
                     .unwrap_or(&chunk.replicas);
+                // Shard locations come from the shard's live chunk record,
+                // so repairs that moved a shard are reflected in reads.
+                let erasure = chunk.erasure.as_ref().map(|erasure| pb::ErasureInfo {
+                    data_shards: erasure.data_shards,
+                    parity_shards: erasure.parity_shards,
+                    shard_size: erasure.shard_size,
+                    shards: erasure
+                        .shards
+                        .iter()
+                        .map(|shard| {
+                            let node_id = state
+                                .chunk_records
+                                .get(&shard.chunk_id)
+                                .and_then(|record| record.replicas.first())
+                                .map(|replica| replica.node_id.clone())
+                                .unwrap_or_else(|| shard.node_id.clone());
+                            pb::ErasureShard {
+                                chunk_id: shard.chunk_id.clone(),
+                                checksum: shard.checksum.clone(),
+                                replica: state
+                                    .chunk_server_addr(&node_id)
+                                    .map(|addr| pb::ChunkReplica { node_id, addr }),
+                            }
+                        })
+                        .collect(),
+                });
                 pb::ChunkRef {
                     chunk_id: chunk.chunk_id.clone(),
                     offset: chunk.offset,
@@ -2082,6 +2363,7 @@ fn file_manifest_to_proto(state: &MetadataStateMachine, file: &FileRecord) -> pb
                                 })
                         })
                         .collect(),
+                    erasure,
                 }
             })
             .collect(),

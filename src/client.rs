@@ -1,4 +1,5 @@
 use crate::chunk::send_chunk;
+use crate::erasure::ErasureCoder;
 use crate::net::ChannelCache;
 use crate::pb;
 use crate::util::checksum_hex;
@@ -27,6 +28,12 @@ const WRITE_PIPELINE_CHUNKS: usize = 4;
 pub struct WriteOptions {
     pub replication_factor: u32,
     pub chunk_size: u32,
+    /// `Some((data_shards, parity_shards))` stores chunks Reed-Solomon
+    /// erasure-coded across `data + parity` chunkservers instead of fully
+    /// replicated: any `data_shards` of the shards reconstruct a chunk, at a
+    /// storage cost of `(data + parity) / data` instead of
+    /// `replication_factor`.
+    pub erasure: Option<(u32, u32)>,
 }
 
 impl Default for WriteOptions {
@@ -34,6 +41,7 @@ impl Default for WriteOptions {
         Self {
             replication_factor: 3,
             chunk_size: 8 * 1024 * 1024,
+            erasure: None,
         }
     }
 }
@@ -305,12 +313,15 @@ impl Client {
                 let path = path.clone();
                 let options = options.clone();
                 Box::pin(async move {
+                    let (data_shards, parity_shards) = options.erasure.unwrap_or_default();
                     client
                         .begin_upload(pb::BeginUploadRequest {
                             path,
                             mode: mode as i32,
                             replication_factor: options.replication_factor,
                             chunk_size: options.chunk_size,
+                            data_shards,
+                            parity_shards,
                         })
                         .await
                         .map(|response| response.into_inner())
@@ -479,11 +490,11 @@ impl FileWriter {
             self.collect_oldest().await?;
         }
         let client = self.client.clone();
-        let upload_id = self.session.upload_id.clone();
+        let session = self.session.clone();
         let offset = self.offset;
         self.offset += data.len() as u64;
         self.inflight
-            .push_back(tokio::spawn(upload_chunk(client, upload_id, offset, data)));
+            .push_back(tokio::spawn(upload_chunk(client, session, offset, data)));
         Ok(())
     }
 
@@ -506,13 +517,19 @@ impl Drop for FileWriter {
     }
 }
 
-/// Allocates placement for one chunk and replicates it through the primary.
+/// Allocates placement for one chunk and stores it: replicated through the
+/// primary's forwarding chain, or striped shard-per-server for
+/// erasure-coded sessions.
 async fn upload_chunk(
     client: Client,
-    upload_id: String,
+    session: pb::UploadSession,
     offset: u64,
     data: Vec<u8>,
 ) -> Result<pb::CommitChunk> {
+    if session.data_shards > 0 {
+        return upload_erasure_chunk(client, session, offset, data).await;
+    }
+    let upload_id = session.upload_id;
     let checksum = checksum_hex(&data);
     let placement = client
         .call_metadata(|client| {
@@ -520,6 +537,8 @@ async fn upload_chunk(
                 upload_id: upload_id.clone(),
                 size: data.len() as u64,
                 checksum: checksum.clone(),
+                shard_checksums: Vec::new(),
+                shard_size: 0,
             };
             Box::pin(async move { client.allocate_chunk(request).await.map(|r| r.into_inner()) })
         })
@@ -546,6 +565,85 @@ async fn upload_chunk(
         size,
         checksum,
         replicas: placement.replicas,
+        erasure: None,
+    })
+}
+
+/// Encodes one chunk into `data + parity` shards and uploads every shard to
+/// its own chunkserver concurrently.
+async fn upload_erasure_chunk(
+    client: Client,
+    session: pb::UploadSession,
+    offset: u64,
+    data: Vec<u8>,
+) -> Result<pb::CommitChunk> {
+    let coder = ErasureCoder::new(session.data_shards as usize, session.parity_shards as usize)?;
+    let checksum = checksum_hex(&data);
+    let size = data.len() as u64;
+    let shards = coder.encode(&data);
+    let shard_size = shards[0].len() as u64;
+    let shard_checksums = shards
+        .iter()
+        .map(|shard| checksum_hex(shard))
+        .collect::<Vec<_>>();
+
+    let upload_id = session.upload_id.clone();
+    let placement = client
+        .call_metadata(|client| {
+            let request = pb::AllocateChunkRequest {
+                upload_id: upload_id.clone(),
+                size,
+                checksum: checksum.clone(),
+                shard_checksums: shard_checksums.clone(),
+                shard_size,
+            };
+            Box::pin(async move { client.allocate_chunk(request).await.map(|r| r.into_inner()) })
+        })
+        .await?;
+    if placement.shards.len() != shards.len() {
+        bail!(
+            "metadata placed {} shards, expected {}",
+            placement.shards.len(),
+            shards.len()
+        );
+    }
+
+    let shard_count = placement.shards.len();
+    stream::iter(placement.shards.clone().into_iter().zip(shards))
+        .map(|(shard, bytes)| {
+            let client = client.clone();
+            async move {
+                let replica = shard
+                    .replica
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("shard placement is missing its replica"))?;
+                let header = pb::PutChunkHeader {
+                    chunk_id: shard.chunk_id.clone(),
+                    checksum: shard.checksum.clone(),
+                    size: bytes.len() as u64,
+                    forward_targets: Vec::new(),
+                };
+                let channel = client.channels.get(&replica.addr)?;
+                send_chunk(channel, header, bytes).await?;
+                Ok::<_, anyhow::Error>(())
+            }
+        })
+        .buffer_unordered(shard_count.max(1))
+        .try_collect::<Vec<_>>()
+        .await?;
+
+    Ok(pb::CommitChunk {
+        chunk_id: placement.chunk_id,
+        offset,
+        size,
+        checksum,
+        replicas: Vec::new(),
+        erasure: Some(pb::ErasureInfo {
+            data_shards: session.data_shards,
+            parity_shards: session.parity_shards,
+            shard_size,
+            shards: placement.shards,
+        }),
     })
 }
 
@@ -598,6 +696,9 @@ impl FileReader {
 }
 
 async fn read_chunk(client: &Client, chunk: &pb::ChunkRef) -> Result<Vec<u8>> {
+    if let Some(erasure) = &chunk.erasure {
+        return read_erasure_chunk(client, chunk, erasure).await;
+    }
     let mut last_error = None::<anyhow::Error>;
     for replica in &chunk.replicas {
         match read_replica(client, replica, chunk).await {
@@ -615,6 +716,126 @@ async fn read_chunk(client: &Client, chunk: &pb::ChunkRef) -> Result<Vec<u8>> {
         }
     }
     Err(last_error.unwrap_or_else(|| anyhow::anyhow!("failed to read chunk")))
+}
+
+/// Reads an erasure-coded chunk: fetch the data shards (which hold the
+/// original bytes), fall back to parity shards and reconstruction when some
+/// are unreachable or corrupt, and verify the reassembled chunk against the
+/// manifest checksum.
+async fn read_erasure_chunk(
+    client: &Client,
+    chunk: &pb::ChunkRef,
+    erasure: &pb::ErasureInfo,
+) -> Result<Vec<u8>> {
+    let coder = ErasureCoder::new(erasure.data_shards as usize, erasure.parity_shards as usize)?;
+    if erasure.shards.len() != coder.total_shards() {
+        bail!(
+            "manifest lists {} shards, expected {}",
+            erasure.shards.len(),
+            coder.total_shards()
+        );
+    }
+
+    let mut shards: Vec<Option<Vec<u8>>> = vec![None; coder.total_shards()];
+    // Data shards first: when they all arrive no decoding is needed.
+    let shard_size = erasure.shard_size;
+    let fetched = stream::iter(
+        erasure
+            .shards
+            .iter()
+            .cloned()
+            .enumerate()
+            .take(coder.data_shards()),
+    )
+    .map(|(index, shard)| {
+        let client = client.clone();
+        async move {
+            let result = fetch_shard(&client, &shard, shard_size).await;
+            (index, result)
+        }
+    })
+    .buffer_unordered(coder.data_shards())
+    .collect::<Vec<_>>()
+    .await;
+    let mut available = 0usize;
+    for (index, result) in fetched {
+        if let Ok(bytes) = result {
+            shards[index] = Some(bytes);
+            available += 1;
+        }
+    }
+
+    // Walk the parity shards until enough shards are on hand.
+    for (index, shard) in erasure.shards.iter().enumerate().skip(coder.data_shards()) {
+        if available >= coder.data_shards() {
+            break;
+        }
+        if let Ok(bytes) = fetch_shard(client, shard, erasure.shard_size).await {
+            shards[index] = Some(bytes);
+            available += 1;
+        }
+    }
+    if available < coder.data_shards() {
+        bail!(
+            "chunk {} has only {available} of the {} shards needed",
+            chunk.chunk_id,
+            coder.data_shards()
+        );
+    }
+
+    coder.reconstruct(&mut shards)?;
+    let bytes = coder.join(&shards, chunk.size as usize)?;
+    if checksum_hex(&bytes) != chunk.checksum {
+        bail!("checksum mismatch after erasure decode");
+    }
+    Ok(bytes)
+}
+
+/// Fetches one shard and verifies it against its own checksum; failures are
+/// reported to the metadata service so the shard gets rebuilt.
+async fn fetch_shard(
+    client: &Client,
+    shard: &pb::ErasureShard,
+    shard_size: u64,
+) -> Result<Vec<u8>> {
+    let result = async {
+        let replica = shard
+            .replica
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("shard has no live replica"))?;
+        let mut remote = ChunkClient::new(client.channels.get(&replica.addr)?);
+        let response = remote
+            .get_chunk(pb::GetChunkRequest {
+                chunk_id: shard.chunk_id.clone(),
+            })
+            .await?;
+        let mut stream = response.into_inner();
+        let mut bytes = Vec::with_capacity(shard_size as usize);
+        while let Some(message) = stream.message().await? {
+            if let Some(pb::get_chunk_response::Item::Data(data)) = message.item {
+                bytes.extend_from_slice(&data);
+            }
+        }
+        if bytes.len() as u64 != shard_size {
+            bail!("shard size mismatch");
+        }
+        if checksum_hex(&bytes) != shard.checksum {
+            bail!("shard checksum mismatch");
+        }
+        Ok::<_, anyhow::Error>(bytes)
+    }
+    .await;
+
+    if let (Err(error), Some(replica)) = (&result, &shard.replica) {
+        client
+            .report_replica_failure_best_effort(
+                shard.chunk_id.clone(),
+                replica.node_id.clone(),
+                format!("shard read failure from {}: {error}", replica.addr),
+            )
+            .await;
+    }
+    result
 }
 
 /// Reads one replica end to end and verifies the bytes against the manifest
