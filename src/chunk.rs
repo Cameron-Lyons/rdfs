@@ -1,4 +1,5 @@
 use crate::model::ChunkInventoryEntry;
+use crate::net::ChannelCache;
 use crate::pb;
 use crate::util::digest_hex;
 use anyhow::{Context, Result, bail};
@@ -10,6 +11,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::fs;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -40,6 +42,9 @@ pub struct ChunkStore {
     db: Arc<DB>,
     chunks: RwLock<BTreeMap<String, LocalChunkRecord>>,
     capacity: u64,
+    /// Bytes stored plus bytes reserved by in-flight writes. Kept as a
+    /// counter so capacity checks and heartbeats do not scan every record.
+    used_bytes: AtomicU64,
 }
 
 impl ChunkStore {
@@ -65,11 +70,13 @@ impl ChunkStore {
             let chunk: LocalChunkRecord = serde_json::from_slice(&value)?;
             chunks.insert(chunk.chunk_id.clone(), chunk);
         }
+        let used_bytes = chunks.values().map(|chunk| chunk.size).sum();
         Ok(Arc::new(Self {
             data_dir,
             db,
             chunks: RwLock::new(chunks),
             capacity,
+            used_bytes: AtomicU64::new(used_bytes),
         }))
     }
 
@@ -82,18 +89,20 @@ impl ChunkStore {
         checksum: &str,
         size: u64,
     ) -> Result<ChunkWriter> {
-        let projected = self.used().await + size;
-        if projected > self.capacity {
-            bail!("capacity exceeded");
-        }
-
+        self.reserve(size)?;
         let file_name = format!("{chunk_id}.chunk");
         let path = self.data_dir.join("chunks").join(&file_name);
         let tmp_path = self
             .data_dir
             .join("chunks")
             .join(format!("{file_name}.tmp"));
-        let file = fs::File::create(&tmp_path).await?;
+        let file = match fs::File::create(&tmp_path).await {
+            Ok(file) => file,
+            Err(error) => {
+                self.release(size);
+                return Err(error.into());
+            }
+        };
 
         Ok(ChunkWriter {
             store: self.clone(),
@@ -108,6 +117,30 @@ impl ChunkStore {
             written: 0,
             finished: false,
         })
+    }
+
+    /// Reserves `size` bytes against capacity, failing when the store is full.
+    fn reserve(&self, size: u64) -> Result<()> {
+        let mut current = self.used_bytes.load(Ordering::Relaxed);
+        loop {
+            let projected = current.saturating_add(size);
+            if projected > self.capacity {
+                bail!("capacity exceeded");
+            }
+            match self.used_bytes.compare_exchange_weak(
+                current,
+                projected,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return Ok(()),
+                Err(actual) => current = actual,
+            }
+        }
+    }
+
+    fn release(&self, size: u64) {
+        self.used_bytes.fetch_sub(size, Ordering::Relaxed);
     }
 
     async fn record(&self, chunk_id: &str) -> Option<LocalChunkRecord> {
@@ -129,17 +162,14 @@ impl ChunkStore {
         let path = self.chunk_path(&record);
         let _ = fs::remove_file(path).await;
         self.db.delete(chunk_key(chunk_id))?;
-        self.chunks.write().await.remove(chunk_id);
+        if self.chunks.write().await.remove(chunk_id).is_some() {
+            self.release(record.size);
+        }
         Ok(())
     }
 
-    pub async fn used(&self) -> u64 {
-        self.chunks
-            .read()
-            .await
-            .values()
-            .map(|chunk| chunk.size)
-            .sum()
+    pub fn used(&self) -> u64 {
+        self.used_bytes.load(Ordering::Relaxed)
     }
 
     pub async fn inventory(&self) -> Vec<ChunkInventoryEntry> {
@@ -217,11 +247,15 @@ impl ChunkWriter {
         self.store
             .db
             .put(chunk_key(&self.chunk_id), serde_json::to_vec(&record)?)?;
-        self.store
+        let previous = self
+            .store
             .chunks
             .write()
             .await
             .insert(self.chunk_id.clone(), record);
+        if let Some(previous) = previous {
+            self.store.release(previous.size);
+        }
         self.finished = true;
         Ok(())
     }
@@ -232,6 +266,7 @@ impl Drop for ChunkWriter {
         if !self.finished {
             self.file.take();
             let _ = std::fs::remove_file(&self.tmp_path);
+            self.store.release(self.expected_size);
         }
     }
 }
@@ -256,6 +291,7 @@ struct ChunkServerInner {
     metadata_addrs: Vec<String>,
     store: Arc<ChunkStore>,
     capacity: u64,
+    channels: Arc<ChannelCache>,
     shutdown: watch::Sender<bool>,
 }
 
@@ -271,6 +307,7 @@ impl ChunkServer {
                 metadata_addrs: config.metadata_addrs,
                 store,
                 capacity: config.capacity,
+                channels: Arc::new(ChannelCache::default()),
                 shutdown,
             }),
         })
@@ -307,14 +344,15 @@ impl ChunkServer {
     }
 }
 
-/// Uploads one chunk to `addr` as a framed `PutChunk` stream. The receiving
-/// server forwards the frames to `header.forward_targets` while it writes.
+/// Uploads one chunk over `channel` as a framed `PutChunk` stream. The
+/// receiving server forwards the frames to `header.forward_targets` while it
+/// writes.
 pub async fn send_chunk(
-    addr: &str,
+    channel: Channel,
     header: pb::PutChunkHeader,
     data: Vec<u8>,
 ) -> Result<pb::PutChunkResponse> {
-    let mut client = chunk_client(addr).await?;
+    let mut client = pb::chunk_service_client::ChunkServiceClient::new(channel);
     let header_message = pb::PutChunkRequest {
         item: Some(pb::put_chunk_request::Item::Header(header)),
     };
@@ -339,13 +377,12 @@ struct ChunkForwarder {
 
 impl ChunkForwarder {
     async fn open(
+        channel: Channel,
         target: &pb::ChunkReplica,
         header: &pb::PutChunkHeader,
         remaining_targets: &[pb::ChunkReplica],
     ) -> Result<Self> {
-        let mut client = chunk_client(&target.addr)
-            .await
-            .with_context(|| format!("connecting to replica {}", target.addr))?;
+        let mut client = pb::chunk_service_client::ChunkServiceClient::new(channel);
         let (tx, rx) = mpsc::channel::<pb::PutChunkRequest>(FORWARD_QUEUE_FRAMES);
         let forwarded_header = pb::PutChunkHeader {
             chunk_id: header.chunk_id.clone(),
@@ -429,11 +466,19 @@ impl pb::chunk_service_server::ChunkService for ChunkGrpc {
             .await
             .map_err(internal_status)?;
         let mut forwarder = match header.forward_targets.split_first() {
-            Some((next, rest)) => Some(
-                ChunkForwarder::open(next, &header, rest)
-                    .await
-                    .map_err(internal_status)?,
-            ),
+            Some((next, rest)) => {
+                let channel = self
+                    .server
+                    .inner
+                    .channels
+                    .get(&next.addr)
+                    .map_err(internal_status)?;
+                Some(
+                    ChunkForwarder::open(channel, next, &header, rest)
+                        .await
+                        .map_err(internal_status)?,
+                )
+            }
             None => None,
         };
 
@@ -580,19 +625,21 @@ async fn heartbeat_loop(server: ChunkServer) {
             node_id: server.inner.node_id.clone(),
             addr: server.inner.addr.clone(),
             capacity: server.inner.capacity,
-            used: server.inner.store.used().await,
+            used: server.inner.store.used(),
             inventory,
         };
 
         if let Some(addr) = leader_hint.clone()
-            && send_heartbeat(&addr, request.clone()).await.is_ok()
+            && send_heartbeat(&server, &addr, request.clone())
+                .await
+                .is_ok()
         {
             continue;
         }
 
         leader_hint = None;
         for addr in &server.inner.metadata_addrs {
-            match send_heartbeat(addr, request.clone()).await {
+            match send_heartbeat(&server, addr, request.clone()).await {
                 Ok(Some(leader)) => leader_hint = Some(leader),
                 Ok(None) => {
                     leader_hint = Some(addr.clone());
@@ -609,28 +656,20 @@ async fn heartbeat_loop(server: ChunkServer) {
 }
 
 async fn send_heartbeat(
+    server: &ChunkServer,
     addr: &str,
     request: pb::HeartbeatRequest,
 ) -> Result<Option<String>, Status> {
-    let mut client = metadata_client(addr)
-        .await
+    let channel = server
+        .inner
+        .channels
+        .get(addr)
         .map_err(|e| Status::unavailable(e.to_string()))?;
+    let mut client = pb::metadata_service_client::MetadataServiceClient::new(channel);
     match client.heartbeat(request).await {
         Ok(_) => Ok(None),
         Err(status) => Err(status),
     }
-}
-
-async fn chunk_client(
-    addr: &str,
-) -> Result<pb::chunk_service_client::ChunkServiceClient<Channel>, tonic::transport::Error> {
-    pb::chunk_service_client::ChunkServiceClient::connect(format!("http://{addr}")).await
-}
-
-async fn metadata_client(
-    addr: &str,
-) -> Result<pb::metadata_service_client::MetadataServiceClient<Channel>, tonic::transport::Error> {
-    pb::metadata_service_client::MetadataServiceClient::connect(format!("http://{addr}")).await
 }
 
 fn status_leader_hint(status: &Status) -> Option<String> {
