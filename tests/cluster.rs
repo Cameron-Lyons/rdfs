@@ -203,6 +203,43 @@ async fn create_overwrite_read_and_delete() -> anyhow::Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn large_multi_chunk_files_round_trip() -> anyhow::Result<()> {
+    let _guard = TEST_LOCK.lock().await;
+    let cluster = start_cluster(9650).await?;
+    let client = Client::new(cluster.meta_addrs.clone())?;
+    let _ = client.mkdir("/big").await?;
+
+    // 10 MiB with the default 8 MiB chunk size: the first chunk alone is
+    // larger than tonic's 4 MiB message limit, so this exercises both frame
+    // splitting and multi-chunk manifests.
+    let expected = patterned_bytes(10 * 1024 * 1024);
+    let mut writer = client
+        .create_writer("/big/blob.bin", WriteOptions::default())
+        .await?;
+    for part in expected.chunks(1024 * 1024) {
+        writer.write(part).await?;
+    }
+    let manifest = writer.commit().await?;
+    assert_eq!(manifest.chunks.len(), 2);
+
+    let reader = client.open_reader("/big/blob.bin").await?;
+    assert_eq!(reader.read_all().await?, expected);
+
+    cluster.stop().await;
+    Ok(())
+}
+
+fn patterned_bytes(len: usize) -> Vec<u8> {
+    let mut state = 0x9e3779b97f4a7c15u64;
+    (0..len)
+        .map(|_| {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            (state >> 33) as u8
+        })
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn uncommitted_writes_are_hidden_and_leases_are_exclusive() -> anyhow::Result<()> {
     let _guard = TEST_LOCK.lock().await;
     let cluster = start_cluster(9620).await?;

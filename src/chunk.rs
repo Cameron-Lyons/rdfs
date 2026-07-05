@@ -1,23 +1,31 @@
 use crate::model::ChunkInventoryEntry;
 use crate::pb;
-use crate::util::checksum_hex;
-use anyhow::{Result, bail};
+use crate::util::digest_hex;
+use anyhow::{Context, Result, bail};
 use futures_util::{StreamExt, stream};
 use rocksdb::{DB, Options};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::fs;
-use tokio::io::AsyncWriteExt;
-use tokio::sync::{RwLock, watch};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::{RwLock, mpsc, watch};
+use tokio::task::JoinHandle;
 use tonic::transport::{Channel, Server};
 use tonic::{Request, Response, Status};
 
 const CHUNK_KEY_PREFIX: &str = "chunk/";
-const STREAM_CHUNK_SIZE: usize = 64 * 1024;
+/// Size of individual data frames on streaming chunk transfers. Frames must
+/// stay well under tonic's 4 MiB message limit while chunks themselves can be
+/// arbitrarily large.
+pub const TRANSFER_FRAME_SIZE: usize = 256 * 1024;
+/// Depth of the forwarding queue between an incoming chunk stream and the
+/// downstream replica, in frames.
+const FORWARD_QUEUE_FRAMES: usize = 8;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct LocalChunkRecord {
@@ -65,10 +73,18 @@ impl ChunkStore {
         }))
     }
 
-    pub async fn put_chunk(&self, chunk_id: &str, checksum: &str, data: &[u8]) -> Result<()> {
-        let calculated = checksum_hex(data);
-        if calculated != checksum {
-            bail!("checksum mismatch");
+    /// Starts writing a chunk of a declared size and checksum. Data is
+    /// appended incrementally and hashed as it arrives; the chunk becomes
+    /// visible atomically once [`ChunkWriter::finish`] verifies it.
+    pub async fn begin_write(
+        self: &Arc<Self>,
+        chunk_id: &str,
+        checksum: &str,
+        size: u64,
+    ) -> Result<ChunkWriter> {
+        let projected = self.used().await + size;
+        if projected > self.capacity {
+            bail!("capacity exceeded");
         }
 
         let file_name = format!("{chunk_id}.chunk");
@@ -77,51 +93,29 @@ impl ChunkStore {
             .data_dir
             .join("chunks")
             .join(format!("{file_name}.tmp"));
+        let file = fs::File::create(&tmp_path).await?;
 
-        let projected = self.used().await + data.len() as u64;
-        if projected > self.capacity {
-            bail!("capacity exceeded");
-        }
-
-        let mut file = fs::File::create(&tmp_path).await?;
-        file.write_all(data).await?;
-        file.sync_data().await?;
-        drop(file);
-        fs::rename(&tmp_path, &path).await?;
-
-        let record = LocalChunkRecord {
+        Ok(ChunkWriter {
+            store: self.clone(),
             chunk_id: chunk_id.to_string(),
-            checksum: checksum.to_string(),
-            size: data.len() as u64,
+            expected_checksum: checksum.to_string(),
+            expected_size: size,
+            file: Some(file),
+            tmp_path,
+            path,
             file_name,
-        };
-        self.db
-            .put(
-                chunk_key(chunk_id),
-                serde_json::to_vec(&record).map_err(|e| anyhow::anyhow!(e))?,
-            )
-            .map_err(|e| anyhow::anyhow!(e))?;
-        self.chunks
-            .write()
-            .await
-            .insert(chunk_id.to_string(), record);
-        Ok(())
+            hasher: Sha256::new(),
+            written: 0,
+            finished: false,
+        })
     }
 
-    async fn get_chunk(&self, chunk_id: &str) -> Result<(LocalChunkRecord, Vec<u8>)> {
-        let record = self
-            .chunks
-            .read()
-            .await
-            .get(chunk_id)
-            .cloned()
-            .ok_or_else(|| anyhow::anyhow!("chunk not found"))?;
-        let path = self.data_dir.join("chunks").join(&record.file_name);
-        let data = fs::read(path).await?;
-        if checksum_hex(&data) != record.checksum {
-            bail!("chunk checksum mismatch");
-        }
-        Ok((record, data))
+    async fn record(&self, chunk_id: &str) -> Option<LocalChunkRecord> {
+        self.chunks.read().await.get(chunk_id).cloned()
+    }
+
+    fn chunk_path(&self, record: &LocalChunkRecord) -> PathBuf {
+        self.data_dir.join("chunks").join(&record.file_name)
     }
 
     pub async fn delete_chunk(&self, chunk_id: &str) -> Result<()> {
@@ -132,7 +126,7 @@ impl ChunkStore {
             .get(chunk_id)
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("chunk not found"))?;
-        let path = self.data_dir.join("chunks").join(&record.file_name);
+        let path = self.chunk_path(&record);
         let _ = fs::remove_file(path).await;
         self.db.delete(chunk_key(chunk_id))?;
         self.chunks.write().await.remove(chunk_id);
@@ -159,6 +153,86 @@ impl ChunkStore {
                 size: chunk.size,
             })
             .collect()
+    }
+}
+
+/// In-progress write of a single chunk to a temporary file. Dropping the
+/// writer without finishing removes the temporary file.
+pub struct ChunkWriter {
+    store: Arc<ChunkStore>,
+    chunk_id: String,
+    expected_checksum: String,
+    expected_size: u64,
+    file: Option<fs::File>,
+    tmp_path: PathBuf,
+    path: PathBuf,
+    file_name: String,
+    hasher: Sha256,
+    written: u64,
+    finished: bool,
+}
+
+impl ChunkWriter {
+    pub async fn append(&mut self, data: &[u8]) -> Result<()> {
+        if self.written + data.len() as u64 > self.expected_size {
+            bail!("chunk data exceeds declared size");
+        }
+        let file = self
+            .file
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("chunk writer already finished"))?;
+        file.write_all(data).await?;
+        self.hasher.update(data);
+        self.written += data.len() as u64;
+        Ok(())
+    }
+
+    pub async fn finish(mut self) -> Result<()> {
+        if self.written != self.expected_size {
+            bail!(
+                "chunk size mismatch: expected {} bytes, received {}",
+                self.expected_size,
+                self.written
+            );
+        }
+        let calculated = digest_hex(std::mem::take(&mut self.hasher));
+        if calculated != self.expected_checksum {
+            bail!("checksum mismatch");
+        }
+
+        let file = self
+            .file
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("chunk writer already finished"))?;
+        file.sync_data().await?;
+        drop(file);
+        fs::rename(&self.tmp_path, &self.path).await?;
+
+        let record = LocalChunkRecord {
+            chunk_id: self.chunk_id.clone(),
+            checksum: self.expected_checksum.clone(),
+            size: self.expected_size,
+            file_name: self.file_name.clone(),
+        };
+        self.store
+            .db
+            .put(chunk_key(&self.chunk_id), serde_json::to_vec(&record)?)?;
+        self.store
+            .chunks
+            .write()
+            .await
+            .insert(self.chunk_id.clone(), record);
+        self.finished = true;
+        Ok(())
+    }
+}
+
+impl Drop for ChunkWriter {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.file.take();
+            let _ = std::fs::remove_file(&self.tmp_path);
+        }
     }
 }
 
@@ -233,6 +307,93 @@ impl ChunkServer {
     }
 }
 
+/// Uploads one chunk to `addr` as a framed `PutChunk` stream. The receiving
+/// server forwards the frames to `header.forward_targets` while it writes.
+pub async fn send_chunk(
+    addr: &str,
+    header: pb::PutChunkHeader,
+    data: Vec<u8>,
+) -> Result<pb::PutChunkResponse> {
+    let mut client = chunk_client(addr).await?;
+    let header_message = pb::PutChunkRequest {
+        item: Some(pb::put_chunk_request::Item::Header(header)),
+    };
+    let frames = data
+        .chunks(TRANSFER_FRAME_SIZE)
+        .map(|frame| pb::PutChunkRequest {
+            item: Some(pb::put_chunk_request::Item::Data(frame.to_vec())),
+        })
+        .collect::<Vec<_>>();
+    let request = stream::iter(std::iter::once(header_message).chain(frames));
+    let response = client.put_chunk(request).await?;
+    Ok(response.into_inner())
+}
+
+/// Streams incoming chunk frames onward to the next replica in the chain
+/// while the local server writes them, so replication is pipelined instead of
+/// store-and-forward.
+struct ChunkForwarder {
+    tx: mpsc::Sender<pb::PutChunkRequest>,
+    task: JoinHandle<Result<()>>,
+}
+
+impl ChunkForwarder {
+    async fn open(
+        target: &pb::ChunkReplica,
+        header: &pb::PutChunkHeader,
+        remaining_targets: &[pb::ChunkReplica],
+    ) -> Result<Self> {
+        let mut client = chunk_client(&target.addr)
+            .await
+            .with_context(|| format!("connecting to replica {}", target.addr))?;
+        let (tx, rx) = mpsc::channel::<pb::PutChunkRequest>(FORWARD_QUEUE_FRAMES);
+        let forwarded_header = pb::PutChunkHeader {
+            chunk_id: header.chunk_id.clone(),
+            checksum: header.checksum.clone(),
+            size: header.size,
+            forward_targets: remaining_targets.to_vec(),
+        };
+        tx.send(pb::PutChunkRequest {
+            item: Some(pb::put_chunk_request::Item::Header(forwarded_header)),
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("forward stream closed before header"))?;
+
+        let addr = target.addr.clone();
+        let task = tokio::spawn(async move {
+            let request = stream::unfold(rx, |mut rx| async move {
+                rx.recv().await.map(|item| (item, rx))
+            });
+            client
+                .put_chunk(request)
+                .await
+                .with_context(|| format!("replica {addr} rejected chunk"))?;
+            Ok(())
+        });
+        Ok(Self { tx, task })
+    }
+
+    async fn send(&mut self, frame: Vec<u8>) -> Result<()> {
+        self.tx
+            .send(pb::PutChunkRequest {
+                item: Some(pb::put_chunk_request::Item::Data(frame)),
+            })
+            .await
+            .map_err(|_| anyhow::anyhow!("replica closed forward stream"))
+    }
+
+    /// Closes the forward stream and waits for the downstream replica chain
+    /// to acknowledge the chunk. If the forwarder is dropped without calling
+    /// this, closing the stream makes the downstream server reject the
+    /// truncated chunk on its own.
+    async fn finish(self) -> Result<()> {
+        let Self { tx, task } = self;
+        drop(tx);
+        task.await??;
+        Ok(())
+    }
+}
+
 #[derive(Clone)]
 struct ChunkGrpc {
     server: ChunkServer,
@@ -249,32 +410,52 @@ impl pb::chunk_service_server::ChunkService for ChunkGrpc {
         request: Request<tonic::Streaming<pb::PutChunkRequest>>,
     ) -> Result<Response<pb::PutChunkResponse>, Status> {
         let mut stream = request.into_inner();
-        let mut header = None;
-        let mut data = Vec::new();
+        let header = match stream.message().await? {
+            Some(pb::PutChunkRequest {
+                item: Some(pb::put_chunk_request::Item::Header(header)),
+            }) => header,
+            _ => {
+                return Err(Status::invalid_argument(
+                    "first message must be the chunk header",
+                ));
+            }
+        };
+
+        let mut writer = self
+            .server
+            .inner
+            .store
+            .begin_write(&header.chunk_id, &header.checksum, header.size)
+            .await
+            .map_err(internal_status)?;
+        let mut forwarder = match header.forward_targets.split_first() {
+            Some((next, rest)) => Some(
+                ChunkForwarder::open(next, &header, rest)
+                    .await
+                    .map_err(internal_status)?,
+            ),
+            None => None,
+        };
 
         while let Some(message) = stream.message().await? {
             match message.item {
-                Some(pb::put_chunk_request::Item::Header(h)) => header = Some(h),
-                Some(pb::put_chunk_request::Item::Data(chunk)) => data.extend_from_slice(&chunk),
+                Some(pb::put_chunk_request::Item::Data(frame)) => {
+                    writer.append(&frame).await.map_err(internal_status)?;
+                    if let Some(forwarder) = forwarder.as_mut() {
+                        forwarder.send(frame).await.map_err(internal_status)?;
+                    }
+                }
+                Some(pb::put_chunk_request::Item::Header(_)) => {
+                    return Err(Status::invalid_argument("duplicate chunk header"));
+                }
                 None => {}
             }
         }
 
-        let Some(header) = header else {
-            return Err(Status::invalid_argument("missing chunk header"));
-        };
-        self.server
-            .inner
-            .store
-            .put_chunk(&header.chunk_id, &header.checksum, &data)
-            .await
-            .map_err(internal_status)?;
-
-        for replica in &header.forward_targets {
-            replicate_to_peer(replica, &header.chunk_id, &header.checksum, data.clone())
-                .await
-                .map_err(internal_status)?;
+        if let Some(forwarder) = forwarder.take() {
+            forwarder.finish().await.map_err(internal_status)?;
         }
+        writer.finish().await.map_err(internal_status)?;
 
         Ok(Response::new(pb::PutChunkResponse {
             replica: Some(pb::ChunkReplica {
@@ -291,55 +472,64 @@ impl pb::chunk_service_server::ChunkService for ChunkGrpc {
         request: Request<pb::GetChunkRequest>,
     ) -> Result<Response<Self::GetChunkStream>, Status> {
         let request = request.into_inner();
-        let (record, data) = self
-            .server
-            .inner
-            .store
-            .get_chunk(&request.chunk_id)
+        let store = &self.server.inner.store;
+        let record = store
+            .record(&request.chunk_id)
+            .await
+            .ok_or_else(|| Status::not_found("chunk not found"))?;
+        let file = fs::File::open(store.chunk_path(&record))
             .await
             .map_err(internal_status)?;
-        let node_id = self.server.inner.node_id.clone();
+
         let metadata = pb::GetChunkResponse {
             item: Some(pb::get_chunk_response::Item::Metadata(pb::ChunkMetadata {
                 chunk_id: record.chunk_id.clone(),
                 checksum: record.checksum.clone(),
                 size: record.size,
-                node_id,
+                node_id: self.server.inner.node_id.clone(),
             })),
         };
-        let data_stream = stream::unfold((data, 0usize), |(data, offset)| async move {
-            if offset >= data.len() {
+
+        // The chunk is streamed straight from disk and hashed as it goes; a
+        // trailing error is emitted if the bytes no longer match the recorded
+        // checksum so readers fail over to another replica.
+        let state = GetChunkState {
+            file,
+            hasher: Sha256::new(),
+            checksum: record.checksum,
+            done: false,
+        };
+        let data_stream = stream::unfold(state, |mut state| async move {
+            if state.done {
                 return None;
             }
-            let end = (offset + STREAM_CHUNK_SIZE).min(data.len());
-            let response = pb::GetChunkResponse {
-                item: Some(pb::get_chunk_response::Item::Data(
-                    data[offset..end].to_vec(),
-                )),
-            };
-            Some((Ok(response), (data, end)))
+            let mut buffer = vec![0u8; TRANSFER_FRAME_SIZE];
+            match state.file.read(&mut buffer).await {
+                Ok(0) => {
+                    state.done = true;
+                    let calculated = digest_hex(std::mem::take(&mut state.hasher));
+                    if calculated == state.checksum {
+                        None
+                    } else {
+                        Some((Err(Status::data_loss("chunk checksum mismatch")), state))
+                    }
+                }
+                Ok(read) => {
+                    buffer.truncate(read);
+                    state.hasher.update(&buffer);
+                    let response = pb::GetChunkResponse {
+                        item: Some(pb::get_chunk_response::Item::Data(buffer)),
+                    };
+                    Some((Ok(response), state))
+                }
+                Err(error) => {
+                    state.done = true;
+                    Some((Err(Status::data_loss(error.to_string())), state))
+                }
+            }
         });
         let stream = stream::once(async move { Ok::<_, Status>(metadata) }).chain(data_stream);
         Ok(Response::new(Box::pin(stream) as Self::GetChunkStream))
-    }
-
-    async fn replicate_chunk(
-        &self,
-        request: Request<pb::ReplicateChunkRequest>,
-    ) -> Result<Response<pb::PutChunkResponse>, Status> {
-        let request = request.into_inner();
-        self.server
-            .inner
-            .store
-            .put_chunk(&request.chunk_id, &request.checksum, &request.data)
-            .await
-            .map_err(internal_status)?;
-        Ok(Response::new(pb::PutChunkResponse {
-            replica: Some(pb::ChunkReplica {
-                node_id: self.server.inner.node_id.clone(),
-                addr: self.server.inner.addr.clone(),
-            }),
-        }))
     }
 
     async fn delete_chunk(
@@ -355,6 +545,13 @@ impl pb::chunk_service_server::ChunkService for ChunkGrpc {
             .map_err(internal_status)?;
         Ok(Response::new(pb::Empty {}))
     }
+}
+
+struct GetChunkState {
+    file: fs::File,
+    hasher: Sha256,
+    checksum: String,
+    done: bool,
 }
 
 async fn heartbeat_loop(server: ChunkServer) {
@@ -422,23 +619,6 @@ async fn send_heartbeat(
         Ok(_) => Ok(None),
         Err(status) => Err(status),
     }
-}
-
-async fn replicate_to_peer(
-    replica: &pb::ChunkReplica,
-    chunk_id: &str,
-    checksum: &str,
-    data: Vec<u8>,
-) -> Result<()> {
-    let mut client = chunk_client(&replica.addr).await?;
-    client
-        .replicate_chunk(pb::ReplicateChunkRequest {
-            chunk_id: chunk_id.to_string(),
-            checksum: checksum.to_string(),
-            data,
-        })
-        .await?;
-    Ok(())
 }
 
 async fn chunk_client(
