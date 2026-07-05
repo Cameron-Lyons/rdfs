@@ -17,12 +17,30 @@ message ChunkReplica {
   string addr = 2;
 }
 
+message ErasureShard {
+  string chunk_id = 1;
+  string checksum = 2;
+  ChunkReplica replica = 3;
+}
+
+// Erasure-coded chunk layout: the chunk's bytes are striped into
+// data_shards shards of shard_size bytes (zero-padded) plus parity_shards
+// parity shards; any data_shards of them reconstruct the chunk.
+message ErasureInfo {
+  uint32 data_shards = 1;
+  uint32 parity_shards = 2;
+  uint64 shard_size = 3;
+  repeated ErasureShard shards = 4;
+}
+
 message ChunkRef {
   string chunk_id = 1;
   uint64 offset = 2;
   uint64 size = 3;
   string checksum = 4;
   repeated ChunkReplica replicas = 5;
+  // Set for erasure-coded chunks; replicas is empty in that case.
+  ErasureInfo erasure = 6;
 }
 
 message FileManifest {
@@ -53,11 +71,16 @@ message UploadSession {
   uint64 lease_expiry_unix_ms = 2;
   uint32 chunk_size = 4;
   uint32 replication_factor = 5;
+  // Non-zero when the session stores chunks erasure-coded.
+  uint32 data_shards = 6;
+  uint32 parity_shards = 7;
 }
 
 message ChunkPlacement {
   string chunk_id = 1;
   repeated ChunkReplica replicas = 3;
+  // For erasure-coded sessions: one placement per shard, in index order.
+  repeated ErasureShard shards = 4;
 }
 
 message CommitChunk {
@@ -66,6 +89,7 @@ message CommitChunk {
   uint64 size = 3;
   string checksum = 4;
   repeated ChunkReplica replicas = 5;
+  ErasureInfo erasure = 6;
 }
 
 message InventoryChunk {
@@ -103,12 +127,20 @@ message BeginUploadRequest {
   UploadMode mode = 2;
   uint32 replication_factor = 3;
   uint32 chunk_size = 4;
+  // Non-zero to store the file's chunks erasure-coded instead of fully
+  // replicated.
+  uint32 data_shards = 5;
+  uint32 parity_shards = 6;
 }
 
 message AllocateChunkRequest {
   string upload_id = 1;
   uint64 size = 2;
   string checksum = 3;
+  // For erasure-coded sessions: checksums of the data_shards + parity_shards
+  // shards, in index order, each shard_size bytes long.
+  repeated string shard_checksums = 4;
+  uint64 shard_size = 5;
 }
 
 message CommitUploadRequest {
