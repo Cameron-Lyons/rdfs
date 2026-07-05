@@ -364,6 +364,7 @@ pub struct MetadataNode {
 struct MetadataNodeInner {
     id: MetaNodeId,
     addr: String,
+    incoming: std::sync::Mutex<Option<tonic::transport::server::TcpIncoming>>,
     raft: MetaRaft,
     store: Arc<MetaStore>,
     peers: BTreeMap<MetaNodeId, String>,
@@ -382,6 +383,13 @@ pub struct MetadataNodeConfig {
 impl MetadataNode {
     pub async fn open(config: MetadataNodeConfig) -> Result<Self> {
         tokio::fs::create_dir_all(&config.data_dir).await?;
+
+        // Binding up front means `addr()` reports the real port even when
+        // the config asked for an ephemeral one, and the node's own entry in
+        // the peer map always carries the bound address.
+        let (incoming, addr) = crate::net::bind_server(&config.addr)?;
+        let mut peers = config.peers;
+        peers.insert(config.id, addr.clone());
 
         let store = MetaStore::open(config.data_dir.join("rocksdb"))?;
         let election_bias_ms = config.id.saturating_sub(1) * 400;
@@ -413,10 +421,11 @@ impl MetadataNode {
         Ok(Self {
             inner: Arc::new(MetadataNodeInner {
                 id: config.id,
-                addr: config.addr,
+                addr,
+                incoming: std::sync::Mutex::new(Some(incoming)),
                 raft,
                 store,
-                peers: config.peers,
+                peers,
                 channels,
                 shutdown,
             }),
@@ -443,7 +452,13 @@ impl MetadataNode {
     }
 
     pub async fn serve(self, bootstrap: bool) -> Result<()> {
-        let addr = self.inner.addr.parse()?;
+        let incoming = self
+            .inner
+            .incoming
+            .lock()
+            .expect("listener lock poisoned")
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("metadata node is already serving"))?;
         let meta_service = MetadataGrpc { node: self.clone() };
         let raft_service = InternalRaftGrpc { node: self.clone() };
         let mut shutdown = self.inner.shutdown.subscribe();
@@ -466,7 +481,7 @@ impl MetadataNode {
             .add_service(pb::raft_service_server::RaftServiceServer::new(
                 raft_service,
             ))
-            .serve_with_shutdown(addr, async move {
+            .serve_with_incoming_shutdown(incoming, async move {
                 let _ = shutdown.changed().await;
             })
             .await?;

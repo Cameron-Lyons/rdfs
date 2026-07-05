@@ -288,6 +288,7 @@ pub struct ChunkServer {
 struct ChunkServerInner {
     node_id: String,
     addr: String,
+    incoming: std::sync::Mutex<Option<tonic::transport::server::TcpIncoming>>,
     metadata_addrs: Vec<String>,
     store: Arc<ChunkStore>,
     capacity: u64,
@@ -297,13 +298,17 @@ struct ChunkServerInner {
 
 impl ChunkServer {
     pub async fn open(config: ChunkServerConfig) -> Result<Self> {
+        // Binding up front means `addr()` (and therefore heartbeats) reports
+        // the real port even when the config asked for an ephemeral one.
+        let (incoming, addr) = crate::net::bind_server(&config.addr)?;
         let store =
             ChunkStore::open(config.node_id.clone(), config.data_dir, config.capacity).await?;
         let (shutdown, _) = watch::channel(false);
         Ok(Self {
             inner: Arc::new(ChunkServerInner {
                 node_id: config.node_id,
-                addr: config.addr,
+                addr,
+                incoming: std::sync::Mutex::new(Some(incoming)),
                 metadata_addrs: config.metadata_addrs,
                 store,
                 capacity: config.capacity,
@@ -322,7 +327,13 @@ impl ChunkServer {
     }
 
     pub async fn serve(self) -> Result<()> {
-        let addr = self.inner.addr.parse()?;
+        let incoming = self
+            .inner
+            .incoming
+            .lock()
+            .expect("listener lock poisoned")
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("chunk server is already serving"))?;
         let mut shutdown = self.inner.shutdown.subscribe();
         tokio::spawn(heartbeat_loop(self.clone()));
         Server::builder()
@@ -331,7 +342,7 @@ impl ChunkServer {
                     server: self.clone(),
                 },
             ))
-            .serve_with_shutdown(addr, async move {
+            .serve_with_incoming_shutdown(incoming, async move {
                 let _ = shutdown.changed().await;
             })
             .await?;

@@ -2,12 +2,16 @@ use futures_util::TryStreamExt;
 use rdfs::chunk::{ChunkServer, ChunkServerConfig};
 use rdfs::client::{Client, WriteOptions};
 use rdfs::meta::{MetadataNode, MetadataNodeConfig};
+use rdfs::util::unique_id;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::Duration;
 use tokio::task::JoinHandle;
 
-static TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+/// Every server binds an ephemeral port and each cluster lives in its own
+/// temp directory, so tests are independent of each other and of any other
+/// test process running on the machine.
+const EPHEMERAL: &str = "127.0.0.1:0";
 
 struct TestCluster {
     meta_nodes: Vec<MetadataNode>,
@@ -35,42 +39,48 @@ impl TestCluster {
         let _ = tokio::fs::remove_dir_all(self.root_dir).await;
     }
 
-    async fn stop_meta(&mut self, id: u64) -> anyhow::Result<()> {
+    /// Stops the node and returns the address it was serving on, so a
+    /// restart can rebind the exact same address.
+    async fn stop_meta(&mut self, id: u64) -> anyhow::Result<String> {
         let Some(index) = self.meta_nodes.iter().position(|node| node.id() == id) else {
             anyhow::bail!("metadata node {id} not found");
         };
         let node = self.meta_nodes.remove(index);
+        let addr = node.addr().to_string();
         node.shutdown().await?;
         let handle = self.meta_handles.remove(index);
         let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
-        Ok(())
+        Ok(addr)
     }
 
-    async fn add_meta(&mut self, id: u64, addr: String) -> anyhow::Result<()> {
-        let mut peers = self
+    /// Starts a metadata node and returns its bound address. Pass
+    /// [`EPHEMERAL`] for a fresh node or a previous node's address for a
+    /// restart.
+    async fn add_meta(&mut self, id: u64, addr: &str) -> anyhow::Result<String> {
+        let peers = self
             .meta_nodes
             .iter()
             .map(|node| (node.id(), node.addr().to_string()))
             .collect::<BTreeMap<_, _>>();
-        peers.insert(id, addr.clone());
 
         let node = MetadataNode::open(MetadataNodeConfig {
             id,
-            addr: addr.clone(),
+            addr: addr.to_string(),
             data_dir: self.root_dir.join(format!("meta-{id}")),
             peers,
         })
         .await?;
+        let addr = node.addr().to_string();
         self.meta_nodes.push(node.clone());
         self.meta_handles.push(tokio::spawn(async move {
             let _ = node.serve(false).await;
         }));
-        self.meta_addrs.push(addr);
+        self.meta_addrs.push(addr.clone());
         tokio::time::sleep(Duration::from_secs(2)).await;
-        Ok(())
+        Ok(addr)
     }
 
-    async fn add_chunk(&mut self, node_id: &str, addr: String) -> anyhow::Result<()> {
+    async fn add_chunk(&mut self, node_id: &str) -> anyhow::Result<()> {
         if self
             .chunk_servers
             .iter()
@@ -81,7 +91,7 @@ impl TestCluster {
 
         let server = ChunkServer::open(ChunkServerConfig {
             node_id: node_id.to_string(),
-            addr,
+            addr: EPHEMERAL.to_string(),
             data_dir: self.root_dir.join(node_id),
             metadata_addrs: self.meta_addrs.clone(),
             capacity: 10 * 1024 * 1024 * 1024,
@@ -111,30 +121,49 @@ impl TestCluster {
     }
 }
 
-async fn start_cluster(base_port: u16) -> anyhow::Result<TestCluster> {
-    let root_dir = PathBuf::from(format!("/tmp/rdfs-test-{base_port}"));
-    let _ = tokio::fs::remove_dir_all(&root_dir).await;
+async fn start_cluster() -> anyhow::Result<TestCluster> {
+    let root_dir = std::env::temp_dir().join(format!("rdfs-test-{}", unique_id("cluster")));
     tokio::fs::create_dir_all(&root_dir).await?;
 
-    let peers = BTreeMap::from([
-        (1, format!("127.0.0.1:{base_port}")),
-        (2, format!("127.0.0.1:{}", base_port + 1)),
-        (3, format!("127.0.0.1:{}", base_port + 2)),
-    ]);
-    let meta_addrs = peers.values().cloned().collect::<Vec<_>>();
-
-    let mut meta_handles = Vec::new();
+    // Nodes 2 and 3 open (and bind) first so the bootstrap node can be
+    // given their real addresses; each node adds its own bound address to
+    // its peer map when it opens.
     let mut meta_nodes = Vec::new();
-    for (id, addr) in &peers {
+    for id in [2u64, 3] {
+        let peers = meta_nodes
+            .iter()
+            .map(|node: &MetadataNode| (node.id(), node.addr().to_string()))
+            .collect::<BTreeMap<_, _>>();
         let node = MetadataNode::open(MetadataNodeConfig {
-            id: *id,
-            addr: addr.clone(),
+            id,
+            addr: EPHEMERAL.to_string(),
             data_dir: root_dir.join(format!("meta-{id}")),
-            peers: peers.clone(),
+            peers,
         })
         .await?;
-        meta_nodes.push(node.clone());
-        let bootstrap = *id == 1;
+        meta_nodes.push(node);
+    }
+    let peers = meta_nodes
+        .iter()
+        .map(|node| (node.id(), node.addr().to_string()))
+        .collect::<BTreeMap<_, _>>();
+    let bootstrap_node = MetadataNode::open(MetadataNodeConfig {
+        id: 1,
+        addr: EPHEMERAL.to_string(),
+        data_dir: root_dir.join("meta-1"),
+        peers,
+    })
+    .await?;
+    meta_nodes.insert(0, bootstrap_node);
+
+    let meta_addrs = meta_nodes
+        .iter()
+        .map(|node| node.addr().to_string())
+        .collect::<Vec<_>>();
+    let mut meta_handles = Vec::new();
+    for node in &meta_nodes {
+        let node = node.clone();
+        let bootstrap = node.id() == 1;
         meta_handles.push(tokio::spawn(async move {
             let _ = node.serve(bootstrap).await;
         }));
@@ -147,7 +176,7 @@ async fn start_cluster(base_port: u16) -> anyhow::Result<TestCluster> {
     for idx in 0..3u16 {
         let server = ChunkServer::open(ChunkServerConfig {
             node_id: format!("chunk-{}", idx + 1),
-            addr: format!("127.0.0.1:{}", base_port + 10 + idx),
+            addr: EPHEMERAL.to_string(),
             data_dir: root_dir.join(format!("chunk-{}", idx + 1)),
             metadata_addrs: meta_addrs.clone(),
             capacity: 10 * 1024 * 1024 * 1024,
@@ -173,8 +202,7 @@ async fn start_cluster(base_port: u16) -> anyhow::Result<TestCluster> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn create_overwrite_read_and_delete() -> anyhow::Result<()> {
-    let _guard = TEST_LOCK.lock().await;
-    let cluster = start_cluster(9610).await?;
+    let cluster = start_cluster().await?;
     let client = Client::new(cluster.meta_addrs.clone())?;
 
     let _ = client.mkdir("/docs").await?;
@@ -205,8 +233,7 @@ async fn create_overwrite_read_and_delete() -> anyhow::Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn large_multi_chunk_files_round_trip() -> anyhow::Result<()> {
-    let _guard = TEST_LOCK.lock().await;
-    let cluster = start_cluster(9650).await?;
+    let cluster = start_cluster().await?;
     let client = Client::new(cluster.meta_addrs.clone())?;
     let _ = client.mkdir("/big").await?;
 
@@ -265,8 +292,7 @@ fn patterned_bytes(len: usize) -> Vec<u8> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn uncommitted_writes_are_hidden_and_leases_are_exclusive() -> anyhow::Result<()> {
-    let _guard = TEST_LOCK.lock().await;
-    let cluster = start_cluster(9620).await?;
+    let cluster = start_cluster().await?;
     let client = Client::new(cluster.meta_addrs.clone())?;
     let _ = client.mkdir("/tmp").await?;
 
@@ -293,8 +319,7 @@ async fn uncommitted_writes_are_hidden_and_leases_are_exclusive() -> anyhow::Res
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn corrupted_replica_is_repaired_after_read_failure() -> anyhow::Result<()> {
-    let _guard = TEST_LOCK.lock().await;
-    let cluster = start_cluster(9625).await?;
+    let cluster = start_cluster().await?;
     let client = Client::new(cluster.meta_addrs.clone())?;
     let _ = client.mkdir("/repair").await?;
 
@@ -319,8 +344,7 @@ async fn corrupted_replica_is_repaired_after_read_failure() -> anyhow::Result<()
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn upload_fails_when_a_replica_dies_before_chunk_replication() -> anyhow::Result<()> {
-    let _guard = TEST_LOCK.lock().await;
-    let mut cluster = start_cluster(9627).await?;
+    let mut cluster = start_cluster().await?;
     let client = Client::new(cluster.meta_addrs.clone())?;
     let _ = client.mkdir("/degraded").await?;
 
@@ -339,8 +363,7 @@ async fn upload_fails_when_a_replica_dies_before_chunk_replication() -> anyhow::
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn committed_file_survives_single_chunkserver_loss() -> anyhow::Result<()> {
-    let _guard = TEST_LOCK.lock().await;
-    let mut cluster = start_cluster(9628).await?;
+    let mut cluster = start_cluster().await?;
     let client = Client::new(cluster.meta_addrs.clone())?;
     let _ = client.mkdir("/reads").await?;
 
@@ -363,8 +386,7 @@ async fn committed_file_survives_single_chunkserver_loss() -> anyhow::Result<()>
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn restarted_chunkserver_rejoins_manifest_inventory() -> anyhow::Result<()> {
-    let _guard = TEST_LOCK.lock().await;
-    let mut cluster = start_cluster(9629).await?;
+    let mut cluster = start_cluster().await?;
     let client = Client::new(cluster.meta_addrs.clone())?;
     let _ = client.mkdir("/restarts").await?;
 
@@ -390,9 +412,7 @@ async fn restarted_chunkserver_rejoins_manifest_inventory() -> anyhow::Result<()
     )
     .await?;
 
-    cluster
-        .add_chunk("chunk-1", "127.0.0.1:9639".to_string())
-        .await?;
+    cluster.add_chunk("chunk-1").await?;
 
     wait_for_chunk_replica_state(
         &client,
@@ -412,8 +432,7 @@ async fn restarted_chunkserver_rejoins_manifest_inventory() -> anyhow::Result<()
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn metadata_failover_preserves_committed_reads() -> anyhow::Result<()> {
-    let _guard = TEST_LOCK.lock().await;
-    let mut cluster = start_cluster(9630).await?;
+    let mut cluster = start_cluster().await?;
     let client = Client::new(cluster.meta_addrs.clone())?;
     let _ = client.mkdir("/ha").await?;
 
@@ -435,8 +454,7 @@ async fn metadata_failover_preserves_committed_reads() -> anyhow::Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn restarted_metadata_node_recovers_from_disk() -> anyhow::Result<()> {
-    let _guard = TEST_LOCK.lock().await;
-    let mut cluster = start_cluster(9660).await?;
+    let mut cluster = start_cluster().await?;
     let client = Client::new(cluster.meta_addrs.clone())?;
     let _ = client.mkdir("/meta-restart").await?;
 
@@ -448,9 +466,8 @@ async fn restarted_metadata_node_recovers_from_disk() -> anyhow::Result<()> {
 
     // Restart node 3 from its on-disk state (same data dir, same address),
     // then stop node 1 so the restarted node is required for quorum.
-    let restarted_addr = "127.0.0.1:9662".to_string();
-    cluster.stop_meta(3).await?;
-    cluster.add_meta(3, restarted_addr).await?;
+    let restarted_addr = cluster.stop_meta(3).await?;
+    cluster.add_meta(3, &restarted_addr).await?;
     cluster.stop_meta(1).await?;
     tokio::time::sleep(Duration::from_secs(3)).await;
 
@@ -469,8 +486,7 @@ async fn restarted_metadata_node_recovers_from_disk() -> anyhow::Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn metadata_replacement_restores_quorum() -> anyhow::Result<()> {
-    let _guard = TEST_LOCK.lock().await;
-    let mut cluster = start_cluster(9640).await?;
+    let mut cluster = start_cluster().await?;
     let client = Client::new(cluster.meta_addrs.clone())?;
     let _ = client.mkdir("/replace").await?;
 
@@ -481,8 +497,7 @@ async fn metadata_replacement_restores_quorum() -> anyhow::Result<()> {
     writer.commit().await?;
 
     cluster.stop_meta(1).await?;
-    let new_addr = "127.0.0.1:9643".to_string();
-    cluster.add_meta(4, new_addr.clone()).await?;
+    let new_addr = cluster.add_meta(4, EPHEMERAL).await?;
 
     let membership = client.replace_metadata_node(1, 4, new_addr).await?;
     assert_eq!(voter_ids(&membership), vec![2, 3, 4]);

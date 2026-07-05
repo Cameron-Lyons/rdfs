@@ -1,8 +1,8 @@
 use rdfs::chunk::{ChunkServer, ChunkServerConfig};
 use rdfs::client::{Client, WriteOptions};
 use rdfs::meta::{MetadataNode, MetadataNodeConfig};
+use rdfs::util::unique_id;
 use std::collections::BTreeMap;
-use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 /// Measures end-to-end write and read throughput against a local 3x3
@@ -11,30 +11,32 @@ use std::time::{Duration, Instant};
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "throughput benchmark, run explicitly"]
 async fn upload_throughput_bench() -> anyhow::Result<()> {
-    let base_port = 42100u16;
-    let root_dir = PathBuf::from(format!("/tmp/rdfs-bench-{base_port}"));
-    let _ = tokio::fs::remove_dir_all(&root_dir).await;
+    let root_dir = std::env::temp_dir().join(format!("rdfs-bench-{}", unique_id("bench")));
     tokio::fs::create_dir_all(&root_dir).await?;
 
-    let peers = BTreeMap::from([
-        (1u64, format!("127.0.0.1:{base_port}")),
-        (2, format!("127.0.0.1:{}", base_port + 1)),
-        (3, format!("127.0.0.1:{}", base_port + 2)),
-    ]);
-    let meta_addrs = peers.values().cloned().collect::<Vec<_>>();
-
     let mut handles = Vec::new();
-    let mut meta_nodes = Vec::new();
-    for (id, addr) in &peers {
+    let mut meta_nodes: Vec<MetadataNode> = Vec::new();
+    for id in [2u64, 3, 1] {
+        let peers = meta_nodes
+            .iter()
+            .map(|node| (node.id(), node.addr().to_string()))
+            .collect::<BTreeMap<_, _>>();
         let node = MetadataNode::open(MetadataNodeConfig {
-            id: *id,
-            addr: addr.clone(),
+            id,
+            addr: "127.0.0.1:0".to_string(),
             data_dir: root_dir.join(format!("meta-{id}")),
-            peers: peers.clone(),
+            peers,
         })
         .await?;
-        meta_nodes.push(node.clone());
-        let bootstrap = *id == 1;
+        meta_nodes.push(node);
+    }
+    let meta_addrs = meta_nodes
+        .iter()
+        .map(|node| node.addr().to_string())
+        .collect::<Vec<_>>();
+    for node in &meta_nodes {
+        let node = node.clone();
+        let bootstrap = node.id() == 1;
         handles.push(tokio::spawn(async move {
             let _ = node.serve(bootstrap).await;
         }));
@@ -45,7 +47,7 @@ async fn upload_throughput_bench() -> anyhow::Result<()> {
     for offset in 0..3u16 {
         let server = ChunkServer::open(ChunkServerConfig {
             node_id: format!("chunk-{}", offset + 1),
-            addr: format!("127.0.0.1:{}", base_port + 10 + offset),
+            addr: "127.0.0.1:0".to_string(),
             data_dir: root_dir.join(format!("chunk-{}", offset + 1)),
             metadata_addrs: meta_addrs.clone(),
             capacity: 10 * 1024 * 1024 * 1024,
