@@ -41,7 +41,6 @@ const LOG_PREFIX: &str = "log/";
 const VOTE_KEY: &[u8] = b"vote";
 const COMMITTED_KEY: &[u8] = b"committed";
 const LAST_PURGED_KEY: &[u8] = b"last_purged";
-const STATE_MACHINE_KEY: &[u8] = b"state_machine";
 const SNAPSHOT_META_KEY: &[u8] = b"snapshot_meta";
 const SNAPSHOT_DATA_KEY: &[u8] = b"snapshot_data";
 const ACTIVE_CHUNKSERVER_WINDOW_MS: u64 = 15_000;
@@ -73,11 +72,19 @@ impl MetaStore {
         let vote = load_json(&db, VOTE_KEY)?;
         let committed = load_json(&db, COMMITTED_KEY)?;
         let last_purged = load_json(&db, LAST_PURGED_KEY)?;
-        let state_machine =
-            load_json(&db, STATE_MACHINE_KEY)?.unwrap_or_else(MetadataStateMachine::default);
         let snapshot_meta: Option<SnapshotMeta<MetaTypeConfig>> =
             load_json(&db, SNAPSHOT_META_KEY)?;
         let snapshot_data: Option<Vec<u8>> = load_json(&db, SNAPSHOT_DATA_KEY)?;
+
+        // The state machine is kept in memory and made durable through
+        // snapshots plus the persisted log: recovery starts from the latest
+        // snapshot (or an empty namespace) and Raft re-applies the remaining
+        // committed log entries. This keeps applies O(entry) instead of
+        // re-serializing the whole state machine on every write.
+        let state_machine = match &snapshot_data {
+            Some(data) => serde_json::from_slice(data)?,
+            None => MetadataStateMachine::default(),
+        };
 
         let mut log = BTreeMap::new();
         for item in db.iterator(rocksdb::IteratorMode::Start) {
@@ -108,12 +115,15 @@ impl MetaStore {
         }))
     }
 
-    async fn persist_state_machine(&self, state: &MetadataStateMachine) -> io::Result<()> {
-        put_json(&self.db, STATE_MACHINE_KEY, state)
-    }
-
     async fn state_snapshot(&self) -> MetadataStateMachine {
         self.state_machine.read().await.clone()
+    }
+
+    /// Runs `f` against the current state machine under a read lock, without
+    /// cloning the state.
+    async fn with_state<R>(&self, f: impl FnOnce(&MetadataStateMachine) -> R) -> R {
+        let state = self.state_machine.read().await;
+        f(&state)
     }
 }
 
@@ -204,14 +214,14 @@ impl RaftLogStorage<MetaTypeConfig> for Arc<MetaStore> {
         I::IntoIter: openraft::OptionalSend,
     {
         let mut log_guard = self.log.write().await;
+        let mut batch = rocksdb::WriteBatch::default();
         for entry in entries {
             let bytes = serde_json::to_vec(&entry)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-            self.db
-                .put(log_key(entry.index()), bytes)
-                .map_err(rocksdb_err_to_io)?;
+            batch.put(log_key(entry.index()), bytes);
             log_guard.insert(entry.index(), entry);
         }
+        self.db.write(batch).map_err(rocksdb_err_to_io)?;
         callback.io_completed(Ok(()));
         Ok(())
     }
@@ -226,10 +236,12 @@ impl RaftLogStorage<MetaTypeConfig> for Arc<MetaStore> {
             .range(start_index..)
             .map(|(idx, _)| *idx)
             .collect();
+        let mut batch = rocksdb::WriteBatch::default();
         for key in keys {
             log_guard.remove(&key);
-            self.db.delete(log_key(key)).map_err(rocksdb_err_to_io)?;
+            batch.delete(log_key(key));
         }
+        self.db.write(batch).map_err(rocksdb_err_to_io)?;
         Ok(())
     }
 
@@ -242,10 +254,12 @@ impl RaftLogStorage<MetaTypeConfig> for Arc<MetaStore> {
             .range(..=log_id.index())
             .map(|(idx, _)| *idx)
             .collect();
+        let mut batch = rocksdb::WriteBatch::default();
         for key in keys {
             log_guard.remove(&key);
-            self.db.delete(log_key(key)).map_err(rocksdb_err_to_io)?;
+            batch.delete(log_key(key));
         }
+        self.db.write(batch).map_err(rocksdb_err_to_io)?;
         Ok(())
     }
 }
@@ -292,7 +306,6 @@ impl RaftStateMachine<MetaTypeConfig> for Arc<MetaStore> {
             }
         }
 
-        self.persist_state_machine(&state).await?;
         Ok(())
     }
 
@@ -315,7 +328,6 @@ impl RaftStateMachine<MetaTypeConfig> for Arc<MetaStore> {
 
         put_json(&self.db, SNAPSHOT_META_KEY, meta)?;
         put_json(&self.db, SNAPSHOT_DATA_KEY, &data)?;
-        self.persist_state_machine(&state).await?;
 
         *self.state_machine.write().await = state;
         *self.current_snapshot.write().await = Some(MetaSnapshot {
@@ -461,13 +473,18 @@ impl MetadataNode {
         Ok(())
     }
 
-    async fn linearized_state(&self) -> Result<MetadataStateMachine, Status> {
+    /// Runs `f` against the state machine after establishing a leader lease,
+    /// so reads are linearizable without cloning the state per request.
+    async fn with_linearized_state<R>(
+        &self,
+        f: impl FnOnce(&MetadataStateMachine) -> R,
+    ) -> Result<R, Status> {
         self.inner
             .raft
             .ensure_linearizable(ReadPolicy::LeaseRead)
             .await
             .map_err(|e| self.status_from_raft_error(e))?;
-        Ok(self.inner.store.state_snapshot().await)
+        Ok(self.inner.store.with_state(f).await)
     }
 
     fn forward_status(&self) -> Status {
@@ -537,8 +554,22 @@ impl MetadataNode {
     }
 
     async fn cluster_membership(&self) -> Result<pb::ClusterMembership, Status> {
-        let state = self.linearized_state().await?;
-        Ok(cluster_membership_to_proto(&state))
+        self.with_linearized_state(cluster_membership_to_proto)
+            .await
+    }
+
+    /// Returns the stored membership plus the current voter set under a
+    /// leader lease.
+    async fn membership_view(
+        &self,
+    ) -> Result<(StoredMembership<MetaTypeConfig>, BTreeSet<MetaNodeId>), Status> {
+        self.with_linearized_state(|state| {
+            (
+                state.last_membership.clone(),
+                state.last_membership.voter_ids().collect::<BTreeSet<_>>(),
+            )
+        })
+        .await
     }
 
     async fn add_metadata_node(
@@ -547,9 +578,8 @@ impl MetadataNode {
         addr: String,
         promote_to_voter: bool,
     ) -> Result<pb::ClusterMembership, Status> {
-        let state = self.linearized_state().await?;
-        let membership = state.last_membership.membership();
-        let current_voters = state.last_membership.voter_ids().collect::<BTreeSet<_>>();
+        let (stored_membership, current_voters) = self.membership_view().await?;
+        let membership = stored_membership.membership();
 
         if let Some(existing) = membership.get_node(&node_id) {
             if existing.addr != addr {
@@ -594,9 +624,8 @@ impl MetadataNode {
         node_id: MetaNodeId,
         retain_as_learner: bool,
     ) -> Result<pb::ClusterMembership, Status> {
-        let state = self.linearized_state().await?;
-        let membership = state.last_membership.membership();
-        let current_voters = state.last_membership.voter_ids().collect::<BTreeSet<_>>();
+        let (stored_membership, current_voters) = self.membership_view().await?;
+        let membership = stored_membership.membership();
 
         if membership.get_node(&node_id).is_none() {
             return Err(Status::not_found(format!("metadata node {node_id}")));
@@ -642,9 +671,8 @@ impl MetadataNode {
             ));
         }
 
-        let state = self.linearized_state().await?;
-        let membership = state.last_membership.membership();
-        let current_voters = state.last_membership.voter_ids().collect::<BTreeSet<_>>();
+        let (stored_membership, current_voters) = self.membership_view().await?;
+        let membership = stored_membership.membership();
 
         if membership.get_node(&old_node_id).is_none() {
             return Err(Status::not_found(format!("metadata node {old_node_id}")));
@@ -701,21 +729,24 @@ impl pb::metadata_service_server::MetadataService for MetadataGrpc {
         &self,
         request: Request<pb::StatRequest>,
     ) -> Result<Response<pb::FileInfo>, Status> {
-        let state = self.node.linearized_state().await?;
         let path = normalize_path(&request.into_inner().path).map_err(invalid_argument)?;
-        let Some(entry) = state.entries.get(&path) else {
-            return Err(Status::not_found(path));
-        };
-        Ok(Response::new(entry.info().to_proto()))
+        let info = self
+            .node
+            .with_linearized_state(|state| state.entries.get(&path).map(|entry| entry.info()))
+            .await?
+            .ok_or_else(|| Status::not_found(path))?;
+        Ok(Response::new(info.to_proto()))
     }
 
     async fn list(
         &self,
         request: Request<pb::ListRequest>,
     ) -> Result<Response<pb::ListResponse>, Status> {
-        let state = self.node.linearized_state().await?;
-        let entries = state
-            .list_directory(&request.into_inner().path)
+        let path = request.into_inner().path;
+        let entries = self
+            .node
+            .with_linearized_state(|state| state.list_directory(&path))
+            .await?
             .map_err(invalid_argument)?;
         Ok(Response::new(pb::ListResponse {
             entries: entries.into_iter().map(|entry| entry.to_proto()).collect(),
@@ -757,12 +788,15 @@ impl pb::metadata_service_server::MetadataService for MetadataGrpc {
         &self,
         request: Request<pb::OpenFileRequest>,
     ) -> Result<Response<pb::FileManifest>, Status> {
-        let state = self.node.linearized_state().await?;
         let path = normalize_path(&request.into_inner().path).map_err(invalid_argument)?;
-        let Some(NamespaceEntry::File(file)) = state.entries.get(&path) else {
-            return Err(Status::not_found(path));
-        };
-        let manifest = file_manifest_to_proto(&state, file);
+        let manifest = self
+            .node
+            .with_linearized_state(|state| match state.entries.get(&path) {
+                Some(NamespaceEntry::File(file)) => Some(file_manifest_to_proto(state, file)),
+                _ => None,
+            })
+            .await?
+            .ok_or_else(|| Status::not_found(path))?;
         Ok(Response::new(manifest))
     }
 
@@ -828,11 +862,14 @@ impl pb::metadata_service_server::MetadataService for MetadataGrpc {
             .await?;
         Ok(Response::new(match response {
             MetadataResponse::FileManifest(manifest) => {
-                let state = self.node.inner.store.state_snapshot().await;
-                match state.entries.get(&manifest.info.path) {
-                    Some(NamespaceEntry::File(file)) => file_manifest_to_proto(&state, file),
-                    _ => manifest.to_proto(|node_id| state.chunk_server_addr(node_id)),
-                }
+                self.node
+                    .inner
+                    .store
+                    .with_state(|state| match state.entries.get(&manifest.info.path) {
+                        Some(NamespaceEntry::File(file)) => file_manifest_to_proto(state, file),
+                        _ => manifest.to_proto(|node_id| state.chunk_server_addr(node_id)),
+                    })
+                    .await
             }
             MetadataResponse::Error(error) => return Err(Status::failed_precondition(error)),
             other => return Err(Status::internal(format!("unexpected response: {other:?}"))),
@@ -1101,6 +1138,21 @@ async fn gc_loop(node: MetadataNode) {
             continue;
         }
 
+        // Cheap idle check before cloning any state.
+        let has_due = node
+            .inner
+            .store
+            .with_state(|state| {
+                state
+                    .tombstones
+                    .values()
+                    .any(|tombstone| tombstone.delete_after_unix_ms <= now_millis())
+            })
+            .await;
+        if !has_due {
+            continue;
+        }
+
         let state = node.inner.store.state_snapshot().await;
         let due = state
             .tombstones
@@ -1151,6 +1203,16 @@ async fn repair_loop(node: MetadataNode) {
             _ = interval.tick() => {}
         }
         if !node.inner.raft.is_leader() {
+            continue;
+        }
+
+        // Cheap idle check before cloning any state.
+        if node
+            .inner
+            .store
+            .with_state(|state| state.repairs.is_empty())
+            .await
+        {
             continue;
         }
 

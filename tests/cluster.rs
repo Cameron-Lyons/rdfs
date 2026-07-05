@@ -410,6 +410,40 @@ async fn metadata_failover_preserves_committed_reads() -> anyhow::Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn restarted_metadata_node_recovers_from_disk() -> anyhow::Result<()> {
+    let _guard = TEST_LOCK.lock().await;
+    let mut cluster = start_cluster(9660).await?;
+    let client = Client::new(cluster.meta_addrs.clone())?;
+    let _ = client.mkdir("/meta-restart").await?;
+
+    let mut writer = client
+        .create_writer("/meta-restart/file.txt", WriteOptions::default())
+        .await?;
+    writer.write(b"persisted across meta restart").await?;
+    writer.commit().await?;
+
+    // Restart node 3 from its on-disk state (same data dir, same address),
+    // then stop node 1 so the restarted node is required for quorum.
+    let restarted_addr = "127.0.0.1:9662".to_string();
+    cluster.stop_meta(3).await?;
+    cluster.add_meta(3, restarted_addr).await?;
+    cluster.stop_meta(1).await?;
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    let reader = client.open_reader("/meta-restart/file.txt").await?;
+    assert_eq!(reader.read_all().await?, b"persisted across meta restart");
+
+    let mut writer = client
+        .create_writer("/meta-restart/after.txt", WriteOptions::default())
+        .await?;
+    writer.write(b"quorum still writable").await?;
+    writer.commit().await?;
+
+    cluster.stop().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn metadata_replacement_restores_quorum() -> anyhow::Result<()> {
     let _guard = TEST_LOCK.lock().await;
     let mut cluster = start_cluster(9640).await?;
