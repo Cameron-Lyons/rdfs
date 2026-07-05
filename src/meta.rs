@@ -5,6 +5,7 @@ use crate::model::{
     NamespaceEntry, PendingChunk, RepairTask, ReplicaPointer, UploadModeModel, UploadSessionModel,
     UploadSessionState,
 };
+use crate::net::ChannelCache;
 use crate::path::{is_child_of, normalize_path, parent_path};
 use crate::pb;
 use crate::raft::{MetaNodeId, MetaRaft, MetaTypeConfig};
@@ -348,6 +349,7 @@ struct MetadataNodeInner {
     raft: MetaRaft,
     store: Arc<MetaStore>,
     peers: BTreeMap<MetaNodeId, String>,
+    channels: Arc<ChannelCache>,
     shutdown: watch::Sender<bool>,
 }
 
@@ -376,7 +378,10 @@ impl MetadataNode {
             }
             .validate()?,
         );
-        let network = MetaNetworkFactory;
+        let channels = Arc::new(ChannelCache::default());
+        let network = MetaNetworkFactory {
+            channels: channels.clone(),
+        };
         let raft = MetaRaft::new(
             config.id,
             raft_config,
@@ -394,6 +399,7 @@ impl MetadataNode {
                 raft,
                 store,
                 peers: config.peers,
+                channels,
                 shutdown,
             }),
         })
@@ -976,12 +982,15 @@ impl pb::raft_service_server::RaftService for InternalRaftGrpc {
     }
 }
 
-#[derive(Clone, Default)]
-struct MetaNetworkFactory;
+#[derive(Clone)]
+struct MetaNetworkFactory {
+    channels: Arc<ChannelCache>,
+}
 
 #[derive(Clone)]
 struct MetaNetworkClient {
     target_node: BasicNode,
+    channels: Arc<ChannelCache>,
 }
 
 impl RaftNetworkFactory<MetaTypeConfig> for MetaNetworkFactory {
@@ -990,7 +999,20 @@ impl RaftNetworkFactory<MetaTypeConfig> for MetaNetworkFactory {
     async fn new_client(&mut self, _target: MetaNodeId, node: &BasicNode) -> Self::Network {
         MetaNetworkClient {
             target_node: node.clone(),
+            channels: self.channels.clone(),
         }
+    }
+}
+
+impl MetaNetworkClient {
+    fn client(
+        &self,
+    ) -> Result<pb::raft_service_client::RaftServiceClient<Channel>, RPCError<MetaTypeConfig>> {
+        let channel = self
+            .channels
+            .get(&self.target_node.addr)
+            .map_err(|e| RPCError::Network(NetworkError::from_string(e.to_string())))?;
+        Ok(pb::raft_service_client::RaftServiceClient::new(channel))
     }
 }
 
@@ -1001,7 +1023,7 @@ impl RaftNetworkV2<MetaTypeConfig> for MetaNetworkClient {
         _option: RPCOption,
     ) -> Result<openraft::raft::AppendEntriesResponse<MetaTypeConfig>, RPCError<MetaTypeConfig>>
     {
-        let mut client = raft_client(&self.target_node.addr).await?;
+        let mut client = self.client()?;
         let response = client
             .append_entries(pb::JsonEnvelope {
                 json: encode_json(&rpc).map_err(network_error)?,
@@ -1016,7 +1038,7 @@ impl RaftNetworkV2<MetaTypeConfig> for MetaNetworkClient {
         rpc: openraft::raft::VoteRequest<MetaTypeConfig>,
         _option: RPCOption,
     ) -> Result<openraft::raft::VoteResponse<MetaTypeConfig>, RPCError<MetaTypeConfig>> {
-        let mut client = raft_client(&self.target_node.addr).await?;
+        let mut client = self.client()?;
         let response = client
             .vote(pb::JsonEnvelope {
                 json: encode_json(&rpc).map_err(network_error)?,
@@ -1036,21 +1058,18 @@ impl RaftNetworkV2<MetaTypeConfig> for MetaNetworkClient {
         _option: RPCOption,
     ) -> Result<SnapshotResponse<MetaTypeConfig>, openraft::error::StreamingError<MetaTypeConfig>>
     {
-        let mut client =
-            raft_client(&self.target_node.addr)
-                .await
-                .map_err(|error| match error {
-                    RPCError::Unreachable(unreachable) => {
-                        openraft::error::StreamingError::Unreachable(unreachable)
-                    }
-                    RPCError::Network(network) => openraft::error::StreamingError::Network(network),
-                    RPCError::Timeout(timeout) => openraft::error::StreamingError::Network(
-                        NetworkError::from_string(timeout.to_string()),
-                    ),
-                    RPCError::RemoteError(remote) => openraft::error::StreamingError::Network(
-                        NetworkError::from_string(remote.to_string()),
-                    ),
-                })?;
+        let mut client = self.client().map_err(|error| match error {
+            RPCError::Unreachable(unreachable) => {
+                openraft::error::StreamingError::Unreachable(unreachable)
+            }
+            RPCError::Network(network) => openraft::error::StreamingError::Network(network),
+            RPCError::Timeout(timeout) => openraft::error::StreamingError::Network(
+                NetworkError::from_string(timeout.to_string()),
+            ),
+            RPCError::RemoteError(remote) => openraft::error::StreamingError::Network(
+                NetworkError::from_string(remote.to_string()),
+            ),
+        })?;
         let response = client
             .install_snapshot(pb::InstallSnapshotRequest {
                 vote_json: encode_json(&vote)
@@ -1101,7 +1120,10 @@ async fn gc_loop(node: MetadataNode) {
                     ok = false;
                     continue;
                 };
-                if delete_chunk(&addr, &tombstone.chunk_id).await.is_err() {
+                if delete_chunk(&node.inner.channels, &addr, &tombstone.chunk_id)
+                    .await
+                    .is_err()
+                {
                     ok = false;
                 }
             }
@@ -1138,7 +1160,8 @@ async fn repair_loop(node: MetadataNode) {
             let Some(record) = state.chunk_records.get(&repair.chunk_id) else {
                 continue;
             };
-            let Some(bytes) = fetch_repair_source(&state, record).await else {
+            let Some(bytes) = fetch_repair_source(&node.inner.channels, &state, record).await
+            else {
                 continue;
             };
 
@@ -1157,6 +1180,7 @@ async fn repair_loop(node: MetadataNode) {
                     break;
                 }
                 if replicate_chunk(
+                    &node.inner.channels,
                     &target.addr,
                     &record.chunk_id,
                     &record.checksum,
@@ -1178,6 +1202,7 @@ async fn repair_loop(node: MetadataNode) {
 }
 
 async fn fetch_repair_source(
+    channels: &ChannelCache,
     state: &MetadataStateMachine,
     record: &ChunkRecord,
 ) -> Option<Vec<u8>> {
@@ -1185,7 +1210,7 @@ async fn fetch_repair_source(
         let Some(source_addr) = state.chunk_server_addr(&replica.node_id) else {
             continue;
         };
-        let Ok(bytes) = fetch_chunk(&source_addr, &record.chunk_id).await else {
+        let Ok(bytes) = fetch_chunk(channels, &source_addr, &record.chunk_id).await else {
             continue;
         };
         if bytes.len() as u64 == record.size && checksum_hex(&bytes) == record.checksum {
@@ -1842,29 +1867,17 @@ fn map_transport_error<C: openraft::RaftTypeConfig>(error: tonic::Status) -> RPC
     RPCError::Unreachable(Unreachable::new(&error))
 }
 
-fn map_transport_connect_error<C: openraft::RaftTypeConfig>(
-    error: tonic::transport::Error,
-) -> RPCError<C> {
-    RPCError::Unreachable(Unreachable::new(&error))
-}
-
-async fn raft_client(
+fn chunk_client(
+    channels: &ChannelCache,
     addr: &str,
-) -> Result<pb::raft_service_client::RaftServiceClient<Channel>, RPCError<MetaTypeConfig>> {
-    let endpoint = format!("http://{addr}");
-    pb::raft_service_client::RaftServiceClient::connect(endpoint)
-        .await
-        .map_err(map_transport_connect_error::<MetaTypeConfig>)
+) -> Result<pb::chunk_service_client::ChunkServiceClient<Channel>> {
+    Ok(pb::chunk_service_client::ChunkServiceClient::new(
+        channels.get(addr)?,
+    ))
 }
 
-async fn chunk_client(
-    addr: &str,
-) -> Result<pb::chunk_service_client::ChunkServiceClient<Channel>, tonic::transport::Error> {
-    pb::chunk_service_client::ChunkServiceClient::connect(format!("http://{addr}")).await
-}
-
-async fn fetch_chunk(addr: &str, chunk_id: &str) -> Result<Vec<u8>> {
-    let mut client = chunk_client(addr).await?;
+async fn fetch_chunk(channels: &ChannelCache, addr: &str, chunk_id: &str) -> Result<Vec<u8>> {
+    let mut client = chunk_client(channels, addr)?;
     let mut stream = client
         .get_chunk(pb::GetChunkRequest {
             chunk_id: chunk_id.to_string(),
@@ -1880,19 +1893,25 @@ async fn fetch_chunk(addr: &str, chunk_id: &str) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
-async fn replicate_chunk(addr: &str, chunk_id: &str, checksum: &str, data: Vec<u8>) -> Result<()> {
+async fn replicate_chunk(
+    channels: &ChannelCache,
+    addr: &str,
+    chunk_id: &str,
+    checksum: &str,
+    data: Vec<u8>,
+) -> Result<()> {
     let header = pb::PutChunkHeader {
         chunk_id: chunk_id.to_string(),
         checksum: checksum.to_string(),
         size: data.len() as u64,
         forward_targets: Vec::new(),
     };
-    crate::chunk::send_chunk(addr, header, data).await?;
+    crate::chunk::send_chunk(channels.get(addr)?, header, data).await?;
     Ok(())
 }
 
-async fn delete_chunk(addr: &str, chunk_id: &str) -> Result<()> {
-    let mut client = chunk_client(addr).await?;
+async fn delete_chunk(channels: &ChannelCache, addr: &str, chunk_id: &str) -> Result<()> {
+    let mut client = chunk_client(channels, addr)?;
     client
         .delete_chunk(pb::DeleteChunkRequest {
             chunk_id: chunk_id.to_string(),

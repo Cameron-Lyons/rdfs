@@ -1,7 +1,9 @@
 use crate::chunk::send_chunk;
+use crate::net::ChannelCache;
 use crate::pb;
 use crate::util::checksum_hex;
 use anyhow::{Result, bail};
+use futures_util::{StreamExt, TryStreamExt, stream};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -12,6 +14,9 @@ use tonic::transport::Channel;
 type MetadataClient = pb::metadata_service_client::MetadataServiceClient<Channel>;
 type ChunkClient = pb::chunk_service_client::ChunkServiceClient<Channel>;
 type MetadataFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, Status>> + Send + 'a>>;
+
+/// How many chunks a reader fetches concurrently.
+const READ_AHEAD_CHUNKS: usize = 4;
 
 #[derive(Debug, Clone)]
 pub struct WriteOptions {
@@ -32,6 +37,7 @@ impl Default for WriteOptions {
 pub struct Client {
     metadata_addrs: Arc<RwLock<Vec<String>>>,
     leader_hint: Arc<RwLock<Option<String>>>,
+    channels: Arc<ChannelCache>,
 }
 
 impl Client {
@@ -46,6 +52,7 @@ impl Client {
         Ok(Self {
             metadata_addrs: Arc::new(RwLock::new(addrs)),
             leader_hint: Arc::new(RwLock::new(None)),
+            channels: Arc::new(ChannelCache::default()),
         })
     }
 
@@ -259,24 +266,29 @@ impl Client {
         let mut last_error = None::<anyhow::Error>;
         for _attempt in 0..40 {
             for addr in self.metadata_order().await {
-                match metadata_client(&addr).await {
-                    Ok(mut client) => match operation(&mut client).await {
-                        Ok(response) => {
-                            *self.leader_hint.write().await = Some(addr);
-                            return Ok(response);
+                let channel = match self.channels.get(&addr) {
+                    Ok(channel) => channel,
+                    Err(error) => {
+                        last_error = Some(anyhow::anyhow!("metadata {addr}: {error}"));
+                        continue;
+                    }
+                };
+                let mut client = MetadataClient::new(channel);
+                match operation(&mut client).await {
+                    Ok(response) => {
+                        *self.leader_hint.write().await = Some(addr);
+                        return Ok(response);
+                    }
+                    Err(status) => {
+                        if let Some(leader) = status_leader_hint(&status) {
+                            last_error = Some(anyhow::anyhow!(
+                                "metadata {addr}: redirected to leader {leader}"
+                            ));
+                            *self.leader_hint.write().await = Some(leader);
+                            continue;
                         }
-                        Err(status) => {
-                            if let Some(leader) = status_leader_hint(&status) {
-                                last_error = Some(anyhow::anyhow!(
-                                    "metadata {addr}: redirected to leader {leader}"
-                                ));
-                                *self.leader_hint.write().await = Some(leader);
-                                continue;
-                            }
-                            last_error = Some(anyhow::anyhow!("metadata {addr}: {status}"));
-                        }
-                    },
-                    Err(error) => last_error = Some(anyhow::anyhow!("metadata {addr}: {error}")),
+                        last_error = Some(anyhow::anyhow!("metadata {addr}: {status}"));
+                    }
                 }
             }
 
@@ -408,7 +420,8 @@ impl FileWriter {
             size,
             forward_targets: placement.replicas.iter().skip(1).cloned().collect(),
         };
-        send_chunk(&primary.addr, header, data).await?;
+        let channel = self.client.channels.get(&primary.addr)?;
+        send_chunk(channel, header, data).await?;
 
         self.chunks.push(pb::CommitChunk {
             chunk_id: placement.chunk_id,
@@ -433,18 +446,19 @@ impl FileReader {
     }
 
     pub async fn read_all(&self) -> Result<Vec<u8>> {
-        let mut result = Vec::new();
-        for chunk in &self.manifest.chunks {
-            result.extend_from_slice(&read_chunk(&self.client, chunk).await?);
-        }
-        Ok(result)
+        let parts = stream::iter(&self.manifest.chunks)
+            .map(|chunk| read_chunk(&self.client, chunk))
+            .buffered(READ_AHEAD_CHUNKS)
+            .try_collect::<Vec<_>>()
+            .await?;
+        Ok(parts.concat())
     }
 }
 
 async fn read_chunk(client: &Client, chunk: &pb::ChunkRef) -> Result<Vec<u8>> {
     let mut last_error = None::<anyhow::Error>;
     for replica in &chunk.replicas {
-        match read_replica(replica, chunk).await {
+        match read_replica(client, replica, chunk).await {
             Ok(bytes) => return Ok(bytes),
             Err(error) => {
                 client
@@ -464,8 +478,12 @@ async fn read_chunk(client: &Client, chunk: &pb::ChunkRef) -> Result<Vec<u8>> {
 /// Reads one replica end to end and verifies the bytes against the manifest
 /// checksum. Any transport, stream, or integrity error is returned so the
 /// caller can fail over to the next replica.
-async fn read_replica(replica: &pb::ChunkReplica, chunk: &pb::ChunkRef) -> Result<Vec<u8>> {
-    let mut remote = chunk_client(&replica.addr).await?;
+async fn read_replica(
+    client: &Client,
+    replica: &pb::ChunkReplica,
+    chunk: &pb::ChunkRef,
+) -> Result<Vec<u8>> {
+    let mut remote = ChunkClient::new(client.channels.get(&replica.addr)?);
     let response = remote
         .get_chunk(pb::GetChunkRequest {
             chunk_id: chunk.chunk_id.clone(),
@@ -495,14 +513,6 @@ async fn read_replica(replica: &pb::ChunkReplica, chunk: &pb::ChunkRef) -> Resul
         bail!("checksum mismatch while reading chunk");
     }
     Ok(bytes)
-}
-
-async fn metadata_client(addr: &str) -> Result<MetadataClient, tonic::transport::Error> {
-    MetadataClient::connect(format!("http://{addr}")).await
-}
-
-async fn chunk_client(addr: &str) -> Result<ChunkClient, tonic::transport::Error> {
-    ChunkClient::connect(format!("http://{addr}")).await
 }
 
 fn status_leader_hint(status: &Status) -> Option<String> {
