@@ -145,7 +145,11 @@ impl RaftLogReader<MetaTypeConfig> for Arc<MetaStore> {
 }
 
 impl RaftSnapshotBuilder<MetaTypeConfig> for Arc<MetaStore> {
-    async fn build_snapshot(&mut self) -> io::Result<SnapshotOf<MetaTypeConfig>> {
+    type SnapshotData = Cursor<Vec<u8>>;
+
+    async fn build_snapshot(
+        &mut self,
+    ) -> io::Result<SnapshotOf<MetaTypeConfig, Self::SnapshotData>> {
         let state = self.state_machine.read().await.clone();
         let data = serde_json::to_vec(&state)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
@@ -271,6 +275,7 @@ impl RaftLogStorage<MetaTypeConfig> for Arc<MetaStore> {
 }
 
 impl RaftStateMachine<MetaTypeConfig> for Arc<MetaStore> {
+    type SnapshotData = Cursor<Vec<u8>>;
     type SnapshotBuilder = Self;
 
     async fn applied_state(
@@ -319,14 +324,14 @@ impl RaftStateMachine<MetaTypeConfig> for Arc<MetaStore> {
         self.clone()
     }
 
-    async fn begin_receiving_snapshot(&mut self) -> io::Result<Cursor<Vec<u8>>> {
+    async fn begin_receiving_snapshot(&mut self) -> io::Result<Self::SnapshotData> {
         Ok(Cursor::new(Vec::new()))
     }
 
     async fn install_snapshot(
         &mut self,
         meta: &SnapshotMetaOf<MetaTypeConfig>,
-        snapshot: Cursor<Vec<u8>>,
+        snapshot: Self::SnapshotData,
     ) -> io::Result<()> {
         let data = snapshot.into_inner();
         let state: MetadataStateMachine = serde_json::from_slice(&data)
@@ -343,7 +348,9 @@ impl RaftStateMachine<MetaTypeConfig> for Arc<MetaStore> {
         Ok(())
     }
 
-    async fn get_current_snapshot(&mut self) -> io::Result<Option<SnapshotOf<MetaTypeConfig>>> {
+    async fn get_current_snapshot(
+        &mut self,
+    ) -> io::Result<Option<SnapshotOf<MetaTypeConfig, Self::SnapshotData>>> {
         Ok(self
             .current_snapshot
             .read()
@@ -1094,6 +1101,8 @@ impl MetaNetworkClient {
 }
 
 impl RaftNetworkV2<MetaTypeConfig> for MetaNetworkClient {
+    type SnapshotData = Cursor<Vec<u8>>;
+
     async fn append_entries(
         &mut self,
         rpc: openraft::raft::AppendEntriesRequest<MetaTypeConfig>,
@@ -1128,7 +1137,7 @@ impl RaftNetworkV2<MetaTypeConfig> for MetaNetworkClient {
     async fn full_snapshot(
         &mut self,
         vote: VoteOf<MetaTypeConfig>,
-        snapshot: SnapshotOf<MetaTypeConfig>,
+        snapshot: SnapshotOf<MetaTypeConfig, Self::SnapshotData>,
         _cancel: impl std::future::Future<Output = openraft::error::ReplicationClosed>
         + openraft::OptionalSend
         + 'static,
