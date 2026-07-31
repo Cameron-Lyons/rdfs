@@ -1102,9 +1102,9 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
 name = "openraft"
-version = "0.10.0-alpha.30"
+version = "0.10.0-alpha.31"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d7ee2febc2358d7d98a2ef862334faced350898361fb1c29cae4aef49f4935ab"
+checksum = "51538caa677a285eafe62ede8a366445383988c2a23344cfdb4e95174717ef38"
 dependencies = [
  "anyerror",
  "backoff-series",
@@ -1131,22 +1131,22 @@ dependencies = [
 
 [[package]]
 name = "openraft-macros"
-version = "0.10.0-alpha.30"
+version = "0.10.0-alpha.31"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "09fb59121d90b48db847cc5c4df2ed0b1ef36d7693a63702ee721637f27c2875"
+checksum = "d08a7d6b0e70b62f4731ad8093fc3a36946eb9afce08c97452730c8529f8636f"
 dependencies = [
  "chrono",
  "proc-macro2",
  "quote",
  "semver",
- "syn 2.0.114",
+ "syn 3.0.3",
 ]
 
 [[package]]
 name = "openraft-rt"
-version = "0.10.0-alpha.30"
+version = "0.10.0-alpha.31"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f547a950b78c2e0935857ea5d63e155c66998334442616c099b88fdde823b39a"
+checksum = "c70d9b071c67407b39cd7e84ee1d56ea117bab3ecf87057688ef0da2d521e4d7"
 dependencies = [
  "futures-channel",
  "futures-util",
@@ -1157,9 +1157,9 @@ dependencies = [
 
 [[package]]
 name = "openraft-rt-tokio"
-version = "0.10.0-alpha.30"
+version = "0.10.0-alpha.31"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7960a1ee0630bde5f0fdbfe883b0bd34fdab9d523eff99bfaa4d0da75ad430ab"
+checksum = "601ff3449a6c1a125f51a0f515eaeddd3417ae82ca42a032dbc851eb62325dc4"
 dependencies = [
  "futures-util",
  "openraft-rt",
