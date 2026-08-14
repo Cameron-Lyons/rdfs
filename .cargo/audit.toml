@@ -1,0 +1,6 @@
+# rkyv 0.7.46 is an unused optional dependency of rust_decimal, pulled in via
+# openraft -> byte-unit. cargo tree does not include rkyv, and rdfs never
+# deserializes rkyv archives. The 0.7 series is unsupported; openraft
+# 0.10.0-alpha.33 drops this dependency chain.
+[advisories]
+ignore = ["RUSTSEC-2026-0235"]
