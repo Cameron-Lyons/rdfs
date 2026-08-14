@@ -153,14 +153,9 @@ impl RaftSnapshotBuilder<MetaTypeConfig> for Arc<MetaStore> {
         let state = self.state_machine.read().await.clone();
         let data = serde_json::to_vec(&state)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-        let snapshot_id = match state.last_applied_log {
-            Some(log_id) => format!("{}-{}", log_id.committed_leader_id(), log_id.index()),
-            None => format!("bootstrap-{}", unique_id("snapshot")),
-        };
         let meta = SnapshotMeta {
             last_log_id: state.last_applied_log,
             last_membership: state.last_membership.clone(),
-            snapshot_id,
         };
 
         put_json(&self.db, SNAPSHOT_META_KEY, &meta)?;
@@ -322,10 +317,6 @@ impl RaftStateMachine<MetaTypeConfig> for Arc<MetaStore> {
 
     async fn get_snapshot_builder(&mut self) -> Self::SnapshotBuilder {
         self.clone()
-    }
-
-    async fn begin_receiving_snapshot(&mut self) -> io::Result<Self::SnapshotData> {
-        Ok(Cursor::new(Vec::new()))
     }
 
     async fn install_snapshot(
