@@ -1108,7 +1108,7 @@ impl RaftNetworkV2<MetaTypeConfig> for MetaNetworkClient {
         _option: RPCOption,
     ) -> Result<openraft::raft::AppendResult<MetaTypeConfig>, RPCError<MetaTypeConfig>> {
         let prev_log_id = rpc.prev_log_id;
-        let last_log_id = rpc.entries.last().map(|e| e.log_id);
+        let last_log_id = rpc.entries.last().map(|e| e.log_id).or(prev_log_id);
 
         let mut client = self.client()?;
         let response = client
