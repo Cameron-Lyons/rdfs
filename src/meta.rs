@@ -398,6 +398,7 @@ impl MetadataNode {
                 election_timeout_min: 500 + election_bias_ms,
                 election_timeout_max: 700 + election_bias_ms,
                 snapshot_policy: openraft::SnapshotPolicy::LogsSinceLast(256),
+                enable_leader_restore: Some(false),
                 ..Default::default()
             }
             .validate()?,
