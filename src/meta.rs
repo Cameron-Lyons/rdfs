@@ -1017,7 +1017,12 @@ impl pb::raft_service_server::RaftService for InternalRaftGrpc {
         request: Request<pb::JsonEnvelope>,
     ) -> Result<Response<pb::JsonEnvelope>, Status> {
         let rpc = decode_json(request.into_inner().json)?;
-        let result = self.node.inner.raft.append_entries(rpc).await
+        let result = self
+            .node
+            .inner
+            .raft
+            .append_entries(rpc)
+            .await
             .map_err(|e| Status::internal(format!("Raft error: {}", e)))?;
         let response = openraft::raft::AppendEntriesResponse::from(result);
         Ok(Response::new(pb::JsonEnvelope {
@@ -1100,11 +1105,10 @@ impl RaftNetworkV2<MetaTypeConfig> for MetaNetworkClient {
         &mut self,
         rpc: openraft::raft::AppendEntriesRequest<MetaTypeConfig>,
         _option: RPCOption,
-    ) -> Result<openraft::raft::AppendResult<MetaTypeConfig>, RPCError<MetaTypeConfig>>
-    {
+    ) -> Result<openraft::raft::AppendResult<MetaTypeConfig>, RPCError<MetaTypeConfig>> {
         let prev_log_id = rpc.prev_log_id;
         let last_log_id = rpc.entries.last().map(|e| e.log_id);
-        
+
         let mut client = self.client()?;
         let response = client
             .append_entries(pb::JsonEnvelope {
@@ -1112,7 +1116,7 @@ impl RaftNetworkV2<MetaTypeConfig> for MetaNetworkClient {
             })
             .await
             .map_err(map_transport_error::<MetaTypeConfig>)?;
-        
+
         let append_resp: openraft::raft::AppendEntriesResponse<MetaTypeConfig> =
             decode_json(response.into_inner().json).map_err(network_error)?;
         Ok(append_resp.into_append_result(prev_log_id, last_log_id))
