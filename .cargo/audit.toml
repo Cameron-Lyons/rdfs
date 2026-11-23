@@ -3,4 +3,4 @@
 # deserializes rkyv archives. The 0.7 series is unsupported; openraft
 # 0.10.0-alpha.33 drops this dependency chain.
 [advisories]
-ignore = ["RUSTSEC-2026-0235"]
+ignore = []
